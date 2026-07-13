@@ -15,11 +15,6 @@ export interface PanoramaItem {
   isObjectUrl?: boolean
 }
 
-export interface GeoCoordinate {
-  lat: number
-  lng: number
-}
-
 export interface PanoramaViewerExpose {
   getCanvas: () => HTMLCanvasElement | null
   renderNow: () => void

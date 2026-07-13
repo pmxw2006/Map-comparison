@@ -656,11 +656,4 @@ defineExpose({
   to { transform: rotate(360deg); }
 }
 
-@media (max-width: 720px) {
-  .panel-heading { top: 12px; left: 12px; }
-  .orientation-hud { top: 10px; right: 10px; transform: scale(0.9); transform-origin: top right; }
-  .view-tools { top: 68px; right: 10px; }
-  .view-tools button { width: 36px; height: 36px; }
-  .panel-footer-overlay { right: 10px; bottom: 10px; left: 12px; }
-}
 </style>

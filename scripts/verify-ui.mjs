@@ -101,21 +101,6 @@ try {
 
   await page.screenshot({ path: `${artifactDir}/desktop.png` })
 
-  await page.getByRole('button', { name: '地图定位' }).click()
-  await page.waitForSelector('.map-panel')
-  const mapTilesLoaded = await page
-    .waitForFunction(
-      () => [...document.querySelectorAll('.leaflet-tile')].some((tile) => tile.complete && tile.naturalWidth > 0),
-      null,
-      { timeout: 20_000 },
-    )
-    .then(() => true)
-    .catch(() => false)
-  // Leaflet 会对新瓦片做淡入，等待动画结束后再留存视觉证据。
-  await page.waitForTimeout(1200)
-  await page.screenshot({ path: `${artifactDir}/map.png` })
-  await page.getByRole('button', { name: '关闭地图' }).click()
-
   await page
     .locator('input[type="file"]')
     .setInputFiles(samplePanorama)
@@ -134,21 +119,6 @@ try {
 
   await page.getByRole('button', { name: '恢复示例' }).click()
   await page.waitForFunction(() => document.querySelectorAll('.panorama-panel').length === 2)
-  await page.setViewportSize({ width: 390, height: 844 })
-  await page.waitForTimeout(300)
-
-  const mobileLayout = await page.evaluate(() => ({
-    viewportWidth: window.innerWidth,
-    documentWidth: document.documentElement.scrollWidth,
-    panelCount: document.querySelectorAll('.panorama-panel').length,
-    panelHeights: [...document.querySelectorAll('.panorama-panel')].map((panel) =>
-      Math.round(panel.getBoundingClientRect().height),
-    ),
-  }))
-  if (mobileLayout.documentWidth > mobileLayout.viewportWidth || mobileLayout.panelHeights.some((height) => height < 240)) {
-    throw new Error(`Mobile layout check failed: ${JSON.stringify(mobileLayout)}`)
-  }
-  await page.screenshot({ path: `${artifactDir}/mobile.png` })
 
   console.log(
     JSON.stringify(
@@ -157,9 +127,7 @@ try {
         beforeDrag,
         afterDrag,
         afterReset,
-        mapTilesLoaded,
         downloads: [original.suggestedFilename(), comparison.suggestedFilename()],
-        mobileLayout,
         browserErrors,
         failedResponses,
         artifacts: artifactDir,

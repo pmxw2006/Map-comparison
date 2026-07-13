@@ -1,13 +1,11 @@
 <script setup lang="ts">
-import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   ArrowLeft,
   CheckCircle2,
   Download,
   Images,
   Link2,
-  MapPin,
-  MapPinned,
   Maximize2,
   Minimize2,
   RotateCcw,
@@ -16,24 +14,16 @@ import {
   Upload,
 } from '@lucide/vue'
 import PanoramaViewer from './components/PanoramaViewer.vue'
-import type {
-  GeoCoordinate,
-  PanoramaItem,
-  PanoramaViewerExpose,
-  ViewState,
-} from './types/panorama'
+import type { PanoramaItem, PanoramaViewerExpose, ViewState } from './types/panorama'
 
 const DEFAULT_VIEW: ViewState = { yaw: 285, pitch: -2, fov: 70 }
 const MAX_PANORAMAS = 4
-const TDT_TOKEN = import.meta.env.VITE_TIANDITU_TOKEN ?? ''
-// 地图只在用户打开定位面板时加载，避免 Leaflet 增加全景首屏体积。
-const MapPanel = defineAsyncComponent(() => import('./components/MapPanel.vue'))
 
 function createDemoPanoramas(): PanoramaItem[] {
   return [
     {
-      id: 'demo-east',
-      name: '滨海步道 · 东侧',
+      id: 'demo-a',
+      name: '全景影像 A',
       tag: '基准影像',
       detail: '7296 × 3648 · 360°',
       src: '/panoramas/key-biscayne-1.jpg',
@@ -41,8 +31,8 @@ function createDemoPanoramas(): PanoramaItem[] {
       northOffset: 0,
     },
     {
-      id: 'demo-west',
-      name: '滨海步道 · 西侧',
+      id: 'demo-b',
+      name: '全景影像 B',
       tag: '对比影像',
       detail: '7296 × 3648 · 360°',
       src: '/panoramas/key-biscayne-2.jpg',
@@ -57,11 +47,9 @@ const views = ref<ViewState[]>(panoramas.value.map(() => ({ ...DEFAULT_VIEW })))
 const activeIndex = ref(0)
 const syncEnabled = ref(true)
 const usingDemo = ref(true)
-const mapOpen = ref(false)
 const isFullscreen = ref(false)
 const filePicker = ref<HTMLInputElement | null>(null)
 const viewerRefs = ref<Array<PanoramaViewerExpose | null>>([])
-const coordinate = ref<GeoCoordinate>({ lat: 18.252847, lng: 109.511909 })
 const toast = ref('')
 let toastTimer = 0
 
@@ -301,10 +289,6 @@ function goBack() {
   else notify('当前已是起始页面')
 }
 
-function updateCoordinate(next: GeoCoordinate) {
-  coordinate.value = next
-}
-
 function handleFullscreenChange() {
   isFullscreen.value = Boolean(document.fullscreenElement)
 }
@@ -330,15 +314,11 @@ onBeforeUnmount(() => {
         <div class="brand-mark" aria-hidden="true"><ScanLine :size="20" /></div>
         <div class="title-block">
           <h1>全景影像对比</h1>
-          <p>滨海步道 · 点位 P-017</p>
+          <p>桌面端多画面同步查看</p>
         </div>
       </div>
 
       <div class="header-actions">
-        <button type="button" :class="{ active: mapOpen }" @click="mapOpen = !mapOpen">
-          <MapPinned :size="17" />
-          <span>地图定位</span>
-        </button>
         <button type="button" class="primary-action" @click="openFilePicker">
           <Upload :size="17" />
           <span>上传全景</span>
@@ -365,10 +345,7 @@ onBeforeUnmount(() => {
       <div class="context-divider" />
       <div><Images :size="14" /> {{ panoramas.length }} 幅全景</div>
       <div class="context-spacer" />
-      <div class="coordinate-readout">
-        <MapPin :size="14" />
-        {{ coordinate.lat.toFixed(5) }}, {{ coordinate.lng.toFixed(5) }}
-      </div>
+      <div>最多 {{ MAX_PANORAMAS }} 幅</div>
     </div>
 
     <main class="workspace">
@@ -388,16 +365,6 @@ onBeforeUnmount(() => {
           @remove="removePanorama(index)"
         />
       </section>
-
-      <Transition name="map-drawer">
-        <MapPanel
-          v-if="mapOpen"
-          :token="TDT_TOKEN"
-          :coordinate="coordinate"
-          @close="mapOpen = false"
-          @update:coordinate="updateCoordinate"
-        />
-      </Transition>
     </main>
 
     <footer class="app-footer">
