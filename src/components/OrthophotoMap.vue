@@ -22,6 +22,7 @@ let imageOverlay: ImageOverlay | null = null
 const selected = computed(() => props.images.find((image) => image.id === props.selectedId) ?? null)
 const nearbyImages = computed(() => {
   if (!selected.value) return []
+  // 后端已按 20 米阈值计算 nearbyIds；这里仅负责把候选列表呈现给用户选择。
   const ids = new Set([selected.value.id, ...selected.value.nearbyIds])
   return props.images.filter((image) => ids.has(image.id) && image.latitude !== null && image.longitude !== null)
 })
@@ -60,6 +61,7 @@ function rebuildMarkers() {
 
 function showSelectedOverlay(fit = false) {
   if (!map) return
+  // Leaflet 的 imageOverlay 不能直接换图和边界；切换影像时先移除旧覆盖层再新建。
   if (imageOverlay) {
     imageOverlay.removeFrom(map)
     imageOverlay = null
@@ -91,6 +93,7 @@ onMounted(async () => {
 
   const token = import.meta.env.VITE_TIANDITU_TOKEN ?? ''
   const subdomains = ['0', '1', '2', '3', '4', '5', '6', '7']
+  // 天地图影像底图和中文标注是两个瓦片层，叠加后保持原地图语义不变。
   L.tileLayer(
     `https://t{s}.tianditu.gov.cn/DataServer?T=img_w&x={x}&y={y}&l={z}&tk=${token}`,
     { subdomains, maxZoom: 18 },

@@ -54,6 +54,7 @@ def database() -> sqlite3.Connection:
 
 def initialize_database() -> None:
     with database() as connection:
+        # 只保存文件索引和元数据，原图/生成图仍落在 data/images 与 data/orthophotos。
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS images (
@@ -130,6 +131,7 @@ def read_metadata(path: Path) -> dict[str, float | int | None]:
         width, height = image.size
         exif = image.getexif()
         if exif:
+            # 普通 GPS 字段在 EXIF GPS IFD 中；大疆 XMP 读不到时会用这里的坐标兜底。
             try:
                 gps = exif.get_ifd(ExifTags.IFD.GPSInfo)
             except (AttributeError, KeyError, TypeError):
@@ -250,6 +252,7 @@ def haversine_meters(first: sqlite3.Row | dict[str, Any], second: sqlite3.Row | 
 
 
 def overlay_bounds(latitude: float, longitude: float, footprint_meters: float) -> list[list[float]]:
+    """把中心点和米制边长换算成 Leaflet imageOverlay 需要的西南/东北经纬度。"""
     half = footprint_meters / 2
     latitude_delta = half / 111_320
     longitude_scale = max(0.1, math.cos(math.radians(latitude)))
@@ -265,6 +268,7 @@ def serialize_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     for row in rows:
         nearby_ids = []
         if row["latitude"] is not None and row["longitude"] is not None:
+            # 同一地点多次拍摄时，前端用 nearby_ids 展示“影像 1/影像 2”选择。
             nearby_ids = [
                 other["id"]
                 for other in rows
@@ -343,6 +347,7 @@ async def upload_images(files: list[UploadFile] = File(...)) -> list[dict[str, A
         size = 0
         try:
             with stored_path.open("wb") as target:
+                # 分块写入，避免大疆高分辨率全景一次性读入内存。
                 while chunk := await upload.read(1024 * 1024):
                     size += len(chunk)
                     if size > MAX_FILE_SIZE:
@@ -409,6 +414,7 @@ async def upload_images(files: list[UploadFile] = File(...)) -> list[dict[str, A
                 )
             inserted_ids.append(image_id)
         except Exception:
+            # 任一处理步骤失败就清理本次上传产生的文件，避免数据库和磁盘状态不一致。
             stored_path.unlink(missing_ok=True)
             (ORTHOPHOTO_DIR / f"{image_id}.jpg").unlink(missing_ok=True)
             raise

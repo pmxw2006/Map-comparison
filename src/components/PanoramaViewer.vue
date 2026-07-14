@@ -166,6 +166,7 @@ function onPointerDown(event: PointerEvent) {
 
 function onPointerMove(event: PointerEvent) {
   if (!dragging.value || pointerId !== event.pointerId) return
+  // 拖拽只更新当前查看器的视角；父组件根据“视角同步”开关决定是否广播给其他全景。
   publishView({
     yaw: dragStartYaw - (event.clientX - dragStartX) * 0.16,
     pitch: dragStartPitch + (event.clientY - dragStartY) * 0.13,
@@ -238,6 +239,7 @@ onMounted(async () => {
     renderer.domElement.setAttribute('aria-hidden', 'true')
     stage.value.prepend(renderer.domElement)
 
+    // 360 全景贴在球体内侧，相机位于球心；缩放和转向都通过相机完成。
     const geometry = new SphereGeometry(500, 72, 48)
     geometry.scale(-1, 1, 1)
     sphere = new Mesh(geometry, new MeshBasicMaterial({ color: 0xffffff }))

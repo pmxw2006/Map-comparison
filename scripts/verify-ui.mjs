@@ -1,14 +1,62 @@
-import { mkdir, readFile } from 'node:fs/promises'
-import { fileURLToPath } from 'node:url'
+import { mkdir } from 'node:fs/promises'
+import { deflateSync } from 'node:zlib'
 import { chromium } from 'playwright'
 
 const baseUrl = process.env.APP_URL ?? 'http://localhost:5173/'
 const apiUrl = new URL('/api/images', baseUrl).href
 const artifactDir = process.env.ARTIFACT_DIR ?? '/tmp/duibi-ui-check'
 const chromePath = process.env.CHROME_PATH ?? '/usr/bin/google-chrome'
-const samplePath = fileURLToPath(new URL('../public/panoramas/key-biscayne-1.jpg', import.meta.url))
-const sampleBuffer = await readFile(samplePath)
 const uploadedIds = []
+
+function crc32(buffer) {
+  let crc = 0xffffffff
+  for (const byte of buffer) {
+    crc ^= byte
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (crc & 1 ? 0xedb88320 : 0)
+  }
+  return (crc ^ 0xffffffff) >>> 0
+}
+
+function pngChunk(type, data = Buffer.alloc(0)) {
+  const name = Buffer.from(type)
+  const chunk = Buffer.alloc(12 + data.length)
+  chunk.writeUInt32BE(data.length, 0)
+  name.copy(chunk, 4)
+  data.copy(chunk, 8)
+  chunk.writeUInt32BE(crc32(Buffer.concat([name, data])), 8 + data.length)
+  return chunk
+}
+
+function makeVerifyPanorama() {
+  const width = 1600
+  const height = 800
+  const raw = Buffer.alloc((width * 3 + 1) * height)
+  for (let y = 0; y < height; y += 1) {
+    const row = y * (width * 3 + 1)
+    raw[row] = 0
+    for (let x = 0; x < width; x += 1) {
+      const offset = row + 1 + x * 3
+      raw[offset] = Math.round((x / width) * 255)
+      raw[offset + 1] = Math.round((y / height) * 255)
+      raw[offset + 2] = (x * 7 + y * 5) % 256
+    }
+  }
+
+  // 直接生成 2:1 PNG，避免验证流程依赖 public 目录中的旧示例图片。
+  const header = Buffer.alloc(13)
+  header.writeUInt32BE(width, 0)
+  header.writeUInt32BE(height, 4)
+  header[8] = 8
+  header[9] = 2
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', header),
+    pngChunk('IDAT', deflateSync(raw)),
+    pngChunk('IEND'),
+  ])
+}
+
+const sampleBuffer = makeVerifyPanorama()
 
 await mkdir(artifactDir, { recursive: true })
 
@@ -40,8 +88,8 @@ try {
   }
 
   await page.locator('input[type="file"]').setInputFiles([
-    { name: 'verify-panorama-a.jpg', mimeType: 'image/jpeg', buffer: sampleBuffer },
-    { name: 'verify-panorama-b.jpg', mimeType: 'image/jpeg', buffer: sampleBuffer },
+    { name: 'verify-panorama-a.png', mimeType: 'image/png', buffer: sampleBuffer },
+    { name: 'verify-panorama-b.png', mimeType: 'image/png', buffer: sampleBuffer },
   ])
   await page.getByText('已永久保存 2 幅影像').waitFor({ timeout: 60_000 })
 

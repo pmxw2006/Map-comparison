@@ -59,6 +59,7 @@ const pitchText = computed(() => {
 const headingText = computed(() => String(normalizedHeading.value).padStart(3, '0'))
 const gridClass = computed(() => `count-${Math.min(panoramas.value.length, MAX_PANORAMAS)}`)
 
+// 后端接口使用 snake_case；进入 Vue 状态前统一转成 camelCase，模板里就不需要关心接口字段格式。
 function fromDto(item: StoredImageDto): PanoramaItem {
   return {
     id: item.id,
@@ -100,6 +101,7 @@ async function responseJson<T>(response: Response): Promise<T> {
   throw new Error(payload?.detail ?? `请求失败（${response.status}）`)
 }
 
+// 影像库变化后重建当前对比区的视角数组，避免删除/上传后出现视角和影像错位。
 function rebuildViews() {
   const source = views.value[activeIndex.value] ?? DEFAULT_VIEW
   views.value = panoramas.value.map(() => ({ ...source }))
@@ -158,6 +160,7 @@ async function handleUpload(event: Event) {
   const form = new FormData()
   selected.forEach((file) => form.append('files', file))
   try {
+    // 上传后端会保存原图、提取大疆元数据，并生成可叠加到天地图的地面反投影结果。
     const uploaded = await responseJson<StoredImageDto[]>(
       await fetch('/api/images', { method: 'POST', body: form }),
     )
@@ -224,6 +227,7 @@ function drawCover(
   width: number,
   height: number,
 ) {
+  // 导出对比图时按 cover 方式裁切每个 WebGL 画面，保持网格统一比例。
   const sourceRatio = source.width / source.height
   const targetRatio = width / height
   let sx = 0
@@ -249,6 +253,7 @@ async function exportComparison() {
     notify('请在全景视图中保存当前对比画面')
     return
   }
+  // 先强制每个 Three.js 查看器渲染当前帧，再从 canvas 读取像素生成下载图。
   const renderers = viewerRefs.value.slice(0, panoramas.value.length)
   renderers.forEach((viewer) => viewer?.renderNow())
   await nextTick()
