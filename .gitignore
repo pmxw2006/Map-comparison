@@ -8,9 +8,17 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+.venv
 dist
 dist-ssr
 *.local
+
+# 本地上传的原始影像、生成结果和目录数据库需要跨重启保留，但不提交到版本库。
+data/catalog.db*
+data/images/*
+!data/images/.gitkeep
+data/orthophotos/*
+!data/orthophotos/.gitkeep
 
 # Editor directories and files
 .vscode/*

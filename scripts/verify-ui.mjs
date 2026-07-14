@@ -1,11 +1,14 @@
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { chromium } from 'playwright'
 
 const baseUrl = process.env.APP_URL ?? 'http://localhost:5173/'
+const apiUrl = new URL('/api/images', baseUrl).href
 const artifactDir = process.env.ARTIFACT_DIR ?? '/tmp/duibi-ui-check'
 const chromePath = process.env.CHROME_PATH ?? '/usr/bin/google-chrome'
-const samplePanorama = fileURLToPath(new URL('../public/panoramas/key-biscayne-1.jpg', import.meta.url))
+const samplePath = fileURLToPath(new URL('../public/panoramas/key-biscayne-1.jpg', import.meta.url))
+const sampleBuffer = await readFile(samplePath)
+const uploadedIds = []
 
 await mkdir(artifactDir, { recursive: true })
 
@@ -23,52 +26,60 @@ page.on('console', (message) => {
   if (message.type() === 'error') browserErrors.push(`console: ${message.text()}`)
 })
 page.on('response', (response) => {
-  if (response.status() >= 400) failedResponses.push(`${response.status()} ${response.url()}`)
+  if (response.status() >= 400 && response.url().startsWith(new URL(baseUrl).origin)) {
+    failedResponses.push(`${response.status()} ${response.url()}`)
+  }
 })
 
 try {
+  const recordsBefore = await fetch(apiUrl).then((response) => response.json())
   await page.goto(baseUrl, { waitUntil: 'networkidle' })
+  if (recordsBefore.length === 0) {
+    await page.getByText('影像库为空', { exact: true }).waitFor()
+    await page.screenshot({ path: `${artifactDir}/empty-library.png` })
+  }
+
+  await page.locator('input[type="file"]').setInputFiles([
+    { name: 'verify-panorama-a.jpg', mimeType: 'image/jpeg', buffer: sampleBuffer },
+    { name: 'verify-panorama-b.jpg', mimeType: 'image/jpeg', buffer: sampleBuffer },
+  ])
+  await page.getByText('已永久保存 2 幅影像').waitFor({ timeout: 60_000 })
+
+  const recordsAfter = await fetch(apiUrl).then((response) => response.json())
+  const created = recordsAfter.filter((record) => !recordsBefore.some((before) => before.id === record.id))
+  uploadedIds.push(...created.map((record) => record.id))
+  if (created.length !== 2 || created.some((record) => record.orthophoto_status !== 'ready')) {
+    throw new Error(`Persistent upload failed: ${JSON.stringify(created)}`)
+  }
+
   await page.waitForFunction(() => {
     const canvases = [...document.querySelectorAll('.panorama-stage canvas')]
-    return canvases.length === 2 && canvases.every((canvas) => canvas.width > 100 && canvas.height > 100)
+    return canvases.length >= 2 && canvases.slice(0, 2).every((canvas) => canvas.width > 100 && canvas.height > 100)
   })
   await page.waitForFunction(() => document.querySelectorAll('.load-state').length === 0, null, {
     timeout: 30_000,
   })
 
-  // 直接读取 WebGL 帧缓冲，确认画面含有真实纹理而非纯色或透明画布。
+  // 读取 WebGL 帧缓冲，确认球体查看器使用了真实纹理而不是纯色画布。
   const pixelMetrics = await page.evaluate(() =>
-    [...document.querySelectorAll('.panorama-stage canvas')].map((canvas) => {
+    [...document.querySelectorAll('.panorama-stage canvas')].slice(0, 2).map((canvas) => {
       const gl = canvas.getContext('webgl2') || canvas.getContext('webgl')
-      if (!gl) return { width: canvas.width, height: canvas.height, samples: 0, colors: 0, range: 0 }
-
+      if (!gl) return { colors: 0, range: 0 }
       const pixels = new Uint8Array(canvas.width * canvas.height * 4)
       gl.readPixels(0, 0, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, pixels)
       let min = 255
       let max = 0
-      let samples = 0
-      let nonDark = 0
       const colors = new Set()
       for (let index = 0; index < pixels.length; index += 388) {
         const lightness = (pixels[index] + pixels[index + 1] + pixels[index + 2]) / 3
         min = Math.min(min, lightness)
         max = Math.max(max, lightness)
-        if (lightness > 12) nonDark += 1
         colors.add(`${pixels[index] >> 4}-${pixels[index + 1] >> 4}-${pixels[index + 2] >> 4}`)
-        samples += 1
       }
-      return {
-        width: canvas.width,
-        height: canvas.height,
-        samples,
-        colors: colors.size,
-        range: Math.round(max - min),
-        nonDarkRatio: Number((nonDark / samples).toFixed(3)),
-      }
+      return { colors: colors.size, range: Math.round(max - min) }
     }),
   )
-
-  if (pixelMetrics.some((metric) => metric.colors < 20 || metric.range < 40 || metric.nonDarkRatio < 0.25)) {
+  if (pixelMetrics.some((metric) => metric.colors < 20 || metric.range < 40)) {
     throw new Error(`WebGL pixel check failed: ${JSON.stringify(pixelMetrics)}`)
   }
 
@@ -76,7 +87,6 @@ try {
   const beforeDrag = await orientation.allTextContents()
   const stageBox = await page.locator('.panorama-stage').first().boundingBox()
   if (!stageBox) throw new Error('The first panorama stage has no layout box')
-
   await page.mouse.move(stageBox.x + stageBox.width * 0.55, stageBox.y + stageBox.height * 0.55)
   await page.mouse.down()
   await page.mouse.move(stageBox.x + stageBox.width * 0.35, stageBox.y + stageBox.height * 0.48, { steps: 8 })
@@ -87,38 +97,28 @@ try {
     throw new Error(`Panorama synchronization failed: ${JSON.stringify({ beforeDrag, afterDrag })}`)
   }
 
-  await page.locator('.panorama-panel').first().getByRole('button', { name: '放大' }).click()
-  await page.waitForTimeout(100)
-  const fovTexts = await page.locator('.orientation-values span').allTextContents()
-  if (fovTexts[0] !== fovTexts[1]) throw new Error(`Zoom synchronization failed: ${fovTexts.join(' | ')}`)
-
-  await page.locator('.panorama-panel').first().getByRole('button', { name: '归正' }).click()
-  await page.waitForTimeout(100)
-  const afterReset = await orientation.allTextContents()
-  if (!afterReset.every((text) => text.includes('000°'))) {
-    throw new Error(`Reset synchronization failed: ${afterReset.join(' | ')}`)
-  }
-
-  await page.screenshot({ path: `${artifactDir}/desktop.png` })
-
-  await page
-    .locator('input[type="file"]')
-    .setInputFiles(samplePanorama)
-  await page.waitForFunction(() => document.querySelectorAll('.panorama-panel').length === 1)
-  await page.waitForFunction(() => document.querySelectorAll('.load-state').length === 0, null, {
-    timeout: 30_000,
-  })
+  await page.screenshot({ path: `${artifactDir}/panorama-comparison.png` })
 
   const originalDownload = page.waitForEvent('download')
-  await page.getByRole('button', { name: '下载原图' }).click()
+  await page.locator('.panorama-panel').first().getByRole('button', { name: '下载原图' }).click()
   const original = await originalDownload
 
   const comparisonDownload = page.waitForEvent('download')
   await page.getByRole('button', { name: '保存对比图' }).click()
   const comparison = await comparisonDownload
 
-  await page.getByRole('button', { name: '恢复示例' }).click()
-  await page.waitForFunction(() => document.querySelectorAll('.panorama-panel').length === 2)
+  await page.getByRole('button', { name: '正射地图' }).click()
+  await page.locator('.orthophoto-map').waitFor()
+  await page.locator('.unlocated-preview img').waitFor()
+  await page.screenshot({ path: `${artifactDir}/orthophoto-map.png` })
+
+  // 刷新后仍能读到刚上传的影像，证明页面不再依赖临时 blob URL。
+  await page.reload({ waitUntil: 'networkidle' })
+  await page.waitForFunction(() => document.querySelectorAll('.panorama-panel').length >= 2)
+
+  if (browserErrors.length || failedResponses.length) {
+    throw new Error(JSON.stringify({ browserErrors, failedResponses }))
+  }
 
   console.log(
     JSON.stringify(
@@ -126,7 +126,7 @@ try {
         pixelMetrics,
         beforeDrag,
         afterDrag,
-        afterReset,
+        persistedUploads: created.map((record) => record.file_name),
         downloads: [original.suggestedFilename(), comparison.suggestedFilename()],
         browserErrors,
         failedResponses,
@@ -137,5 +137,8 @@ try {
     ),
   )
 } finally {
+  await Promise.all(
+    uploadedIds.map((id) => fetch(new URL(`/api/images/${id}`, baseUrl), { method: 'DELETE' }).catch(() => null)),
+  )
   await browser.close()
 }

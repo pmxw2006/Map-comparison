@@ -2,59 +2,52 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   ArrowLeft,
+  Check,
   CheckCircle2,
+  Database,
   Download,
+  GalleryHorizontalEnd,
+  HardDriveUpload,
   Images,
   Link2,
+  LoaderCircle,
+  Map,
   Maximize2,
   Minimize2,
-  RotateCcw,
   ScanLine,
+  Trash2,
   Unlink,
   Upload,
+  X,
 } from '@lucide/vue'
+import OrthophotoMap from './components/OrthophotoMap.vue'
 import PanoramaViewer from './components/PanoramaViewer.vue'
-import type { PanoramaItem, PanoramaViewerExpose, ViewState } from './types/panorama'
+import type { PanoramaItem, PanoramaViewerExpose, StoredImageDto, ViewState } from './types/panorama'
 
-const DEFAULT_VIEW: ViewState = { yaw: 285, pitch: -2, fov: 70 }
+const DEFAULT_VIEW: ViewState = { yaw: 0, pitch: -2, fov: 70 }
 const MAX_PANORAMAS = 4
 
-function createDemoPanoramas(): PanoramaItem[] {
-  return [
-    {
-      id: 'demo-a',
-      name: '全景影像 A',
-      tag: '基准影像',
-      detail: '7296 × 3648 · 360°',
-      src: '/panoramas/key-biscayne-1.jpg',
-      fileName: 'key-biscayne-1.jpg',
-      northOffset: 0,
-    },
-    {
-      id: 'demo-b',
-      name: '全景影像 B',
-      tag: '对比影像',
-      detail: '7296 × 3648 · 360°',
-      src: '/panoramas/key-biscayne-2.jpg',
-      fileName: 'key-biscayne-2.jpg',
-      northOffset: 0,
-    },
-  ]
-}
-
-const panoramas = ref<PanoramaItem[]>(createDemoPanoramas())
-const views = ref<ViewState[]>(panoramas.value.map(() => ({ ...DEFAULT_VIEW })))
+const library = ref<PanoramaItem[]>([])
+const visibleIds = ref<string[]>([])
+const views = ref<ViewState[]>([])
 const activeIndex = ref(0)
+const selectedMapId = ref<string | null>(null)
 const syncEnabled = ref(true)
-const usingDemo = ref(true)
+const workspaceMode = ref<'panorama' | 'orthophoto'>('panorama')
+const libraryOpen = ref(false)
+const loadingCatalog = ref(true)
+const uploading = ref(false)
 const isFullscreen = ref(false)
 const filePicker = ref<HTMLInputElement | null>(null)
 const viewerRefs = ref<Array<PanoramaViewerExpose | null>>([])
 const toast = ref('')
 let toastTimer = 0
 
+const panoramas = computed(() =>
+  visibleIds.value.map((id) => library.value.find((item) => item.id === id)).filter(Boolean) as PanoramaItem[],
+)
 const activeView = computed(() => views.value[activeIndex.value] ?? DEFAULT_VIEW)
-const activePanorama = computed(() => panoramas.value[activeIndex.value] ?? panoramas.value[0])
+const activePanorama = computed(() => panoramas.value[activeIndex.value] ?? null)
 const normalizedHeading = computed(() => {
   const offset = activePanorama.value?.northOffset ?? 0
   return ((Math.round(activeView.value.yaw + offset) % 360) + 360) % 360
@@ -66,6 +59,31 @@ const pitchText = computed(() => {
 const headingText = computed(() => String(normalizedHeading.value).padStart(3, '0'))
 const gridClass = computed(() => `count-${Math.min(panoramas.value.length, MAX_PANORAMAS)}`)
 
+function fromDto(item: StoredImageDto): PanoramaItem {
+  return {
+    id: item.id,
+    name: item.name,
+    tag: item.orthophoto_status === 'ready' ? '全景 · 地面反投影已生成' : '全景影像',
+    detail: `${item.width} × ${item.height} · ${(item.file_size / 1024 / 1024).toFixed(1)} MB`,
+    src: item.image_url,
+    fileName: item.file_name,
+    northOffset: item.north_offset,
+    downloadUrl: item.download_url,
+    createdAt: item.created_at,
+    latitude: item.latitude,
+    longitude: item.longitude,
+    absoluteAltitude: item.absolute_altitude,
+    relativeAltitude: item.relative_altitude,
+    projectionAltitude: item.projection_altitude,
+    heading: item.heading,
+    orthophotoStatus: item.orthophoto_status,
+    orthophotoKind: item.orthophoto_kind,
+    orthophotoUrl: item.orthophoto_url,
+    overlayBounds: item.overlay_bounds,
+    nearbyIds: item.nearby_ids,
+  }
+}
+
 function setViewerRef(element: unknown, index: number) {
   viewerRefs.value[index] = (element as PanoramaViewerExpose | null) ?? null
 }
@@ -73,17 +91,45 @@ function setViewerRef(element: unknown, index: number) {
 function notify(message: string) {
   toast.value = message
   window.clearTimeout(toastTimer)
-  toastTimer = window.setTimeout(() => (toast.value = ''), 2600)
+  toastTimer = window.setTimeout(() => (toast.value = ''), 2800)
 }
 
-// 同步开启时，任一画面的变化都会作为唯一视角源广播到全部查看器。
+async function responseJson<T>(response: Response): Promise<T> {
+  if (response.ok) return response.json() as Promise<T>
+  const payload = await response.json().catch(() => null)
+  throw new Error(payload?.detail ?? `请求失败（${response.status}）`)
+}
+
+function rebuildViews() {
+  const source = views.value[activeIndex.value] ?? DEFAULT_VIEW
+  views.value = panoramas.value.map(() => ({ ...source }))
+  viewerRefs.value = []
+  activeIndex.value = Math.min(activeIndex.value, Math.max(0, panoramas.value.length - 1))
+  if (!selectedMapId.value || !library.value.some((item) => item.id === selectedMapId.value)) {
+    selectedMapId.value = panoramas.value[0]?.id ?? library.value[0]?.id ?? null
+  }
+}
+
+async function loadCatalog(initial = false) {
+  try {
+    const response = await fetch('/api/images')
+    library.value = (await responseJson<StoredImageDto[]>(response)).map(fromDto)
+    if (initial) visibleIds.value = library.value.slice(0, MAX_PANORAMAS).map((item) => item.id)
+    else visibleIds.value = visibleIds.value.filter((id) => library.value.some((item) => item.id === id))
+    rebuildViews()
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '无法连接影像服务')
+  } finally {
+    loadingCatalog.value = false
+  }
+}
+
+// 同步开启时，任一画面的变化都会广播给当前比较区的全部查看器。
 function handleViewChange(index: number, view: ViewState) {
   activeIndex.value = index
-  if (syncEnabled.value) {
-    views.value = views.value.map(() => ({ ...view }))
-  } else {
-    views.value[index] = { ...view }
-  }
+  selectedMapId.value = panoramas.value[index]?.id ?? selectedMapId.value
+  if (syncEnabled.value) views.value = views.value.map(() => ({ ...view }))
+  else views.value[index] = { ...view }
 }
 
 function toggleSync() {
@@ -92,34 +138,14 @@ function toggleSync() {
     const source = { ...activeView.value }
     views.value = views.value.map(() => ({ ...source }))
     notify('已同步到当前活动视角')
-  } else {
-    notify('已切换为独立视角')
-  }
-}
-
-function releaseObjectUrls(items: PanoramaItem[]) {
-  // 浏览器为上传文件创建的 blob URL 不会自动释放，替换和退出时统一回收。
-  items.forEach((item) => {
-    if (item.isObjectUrl) URL.revokeObjectURL(item.src)
-  })
-}
-
-function resetDemo() {
-  releaseObjectUrls(panoramas.value)
-  panoramas.value = createDemoPanoramas()
-  views.value = panoramas.value.map(() => ({ ...DEFAULT_VIEW }))
-  viewerRefs.value = []
-  activeIndex.value = 0
-  syncEnabled.value = true
-  usingDemo.value = true
-  notify('已恢复示例全景')
+  } else notify('已切换为独立视角')
 }
 
 function openFilePicker() {
   filePicker.value?.click()
 }
 
-function handleUpload(event: Event) {
+async function handleUpload(event: Event) {
   const input = event.target as HTMLInputElement
   const selected = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'))
   input.value = ''
@@ -128,56 +154,61 @@ function handleUpload(event: Event) {
     return
   }
 
-  if (usingDemo.value) {
-    releaseObjectUrls(panoramas.value)
-    panoramas.value = []
-    views.value = []
-    viewerRefs.value = []
-    usingDemo.value = false
-  }
-
-  const available = MAX_PANORAMAS - panoramas.value.length
-  if (available <= 0) {
-    notify(`页面最多展示 ${MAX_PANORAMAS} 幅，请先移除一幅影像`)
-    return
-  }
-  const accepted = selected.slice(0, Math.max(0, available))
-  const baseIndex = panoramas.value.length
-  const uploadedItems = accepted.map((file, index): PanoramaItem => ({
-    id: `upload-${Date.now()}-${index}`,
-    name: file.name.replace(/\.[^.]+$/, '') || `上传影像 ${baseIndex + index + 1}`,
-    tag: `上传影像 ${baseIndex + index + 1}`,
-    detail: `${(file.size / 1024 / 1024).toFixed(1)} MB · 本地文件`,
-    src: URL.createObjectURL(file),
-    fileName: file.name,
-    northOffset: 0,
-    isObjectUrl: true,
-  }))
-
-  panoramas.value.push(...uploadedItems)
-  views.value.push(...uploadedItems.map(() => ({ ...activeView.value })))
-  activeIndex.value = Math.max(0, baseIndex)
-
-  if (accepted.length < selected.length) {
-    notify(`已上传 ${accepted.length} 幅，页面最多展示 ${MAX_PANORAMAS} 幅`)
-  } else {
-    notify(`已上传 ${accepted.length} 幅全景图片`)
+  uploading.value = true
+  const form = new FormData()
+  selected.forEach((file) => form.append('files', file))
+  try {
+    const uploaded = await responseJson<StoredImageDto[]>(
+      await fetch('/api/images', { method: 'POST', body: form }),
+    )
+    const uploadedIds = uploaded.map((item) => item.id)
+    await loadCatalog(false)
+    visibleIds.value = [...uploadedIds, ...visibleIds.value.filter((id) => !uploadedIds.includes(id))].slice(
+      0,
+      MAX_PANORAMAS,
+    )
+    selectedMapId.value = uploadedIds[0] ?? selectedMapId.value
+    rebuildViews()
+    notify(`已永久保存 ${uploaded.length} 幅影像${selected.length > MAX_PANORAMAS ? '，其余可在影像库中选择' : ''}`)
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '上传失败')
+  } finally {
+    uploading.value = false
   }
 }
 
+function toggleLibraryItem(id: string) {
+  if (visibleIds.value.includes(id)) {
+    visibleIds.value = visibleIds.value.filter((visibleId) => visibleId !== id)
+  } else if (visibleIds.value.length >= MAX_PANORAMAS) {
+    notify(`对比区最多显示 ${MAX_PANORAMAS} 幅影像`)
+    return
+  } else visibleIds.value.push(id)
+  rebuildViews()
+}
+
 function removePanorama(index: number) {
-  const [removed] = panoramas.value.splice(index, 1)
-  if (removed?.isObjectUrl) URL.revokeObjectURL(removed.src)
-  views.value.splice(index, 1)
-  viewerRefs.value.splice(index, 1)
-  if (index < activeIndex.value) activeIndex.value -= 1
-  activeIndex.value = Math.min(activeIndex.value, panoramas.value.length - 1)
-  notify('已移除影像')
+  const item = panoramas.value[index]
+  if (!item) return
+  visibleIds.value = visibleIds.value.filter((id) => id !== item.id)
+  rebuildViews()
+  notify('已移出当前对比，原文件仍保留在影像库')
+}
+
+async function permanentlyDelete(item: PanoramaItem) {
+  if (!window.confirm(`永久删除“${item.name}”及其生成结果？`)) return
+  try {
+    await responseJson<{ deleted: boolean }>(await fetch(`/api/images/${item.id}`, { method: 'DELETE' }))
+    await loadCatalog(false)
+    notify('影像文件已永久删除')
+  } catch (error) {
+    notify(error instanceof Error ? error.message : '删除失败')
+  }
 }
 
 function downloadOriginal(item: PanoramaItem) {
   const anchor = document.createElement('a')
-  anchor.href = item.src
+  anchor.href = item.downloadUrl
   anchor.download = item.fileName
   document.body.appendChild(anchor)
   anchor.click()
@@ -199,7 +230,6 @@ function drawCover(
   let sy = 0
   let sw = source.width
   let sh = source.height
-
   if (sourceRatio > targetRatio) {
     sw = source.height * targetRatio
     sx = (source.width - sw) / 2
@@ -215,18 +245,20 @@ function canvasToBlob(canvas: HTMLCanvasElement) {
 }
 
 async function exportComparison() {
+  if (workspaceMode.value !== 'panorama') {
+    notify('请在全景视图中保存当前对比画面')
+    return
+  }
   const renderers = viewerRefs.value.slice(0, panoramas.value.length)
   renderers.forEach((viewer) => viewer?.renderNow())
   await nextTick()
   await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-
   const sources = renderers.map((viewer) => viewer?.getCanvas()).filter(Boolean) as HTMLCanvasElement[]
   if (!sources.length) {
     notify('当前没有可导出的全景画面')
     return
   }
 
-  // 统一用 16:9 单元格合成，避免不同屏幕尺寸导致下载结果比例不一致。
   const columns = sources.length === 1 ? 1 : 2
   const rows = Math.ceil(sources.length / columns)
   const cellWidth = 1200
@@ -236,37 +268,21 @@ async function exportComparison() {
   canvas.height = cellHeight * rows
   const context = canvas.getContext('2d')
   if (!context) return
-
   context.fillStyle = '#0e1418'
   context.fillRect(0, 0, canvas.width, canvas.height)
   sources.forEach((source, index) => {
-    const column = index % columns
-    const row = Math.floor(index / columns)
-    const x = column * cellWidth
-    const y = row * cellHeight
+    const x = (index % columns) * cellWidth
+    const y = Math.floor(index / columns) * cellHeight
     drawCover(context, source, x, y, cellWidth, cellHeight)
-
     context.fillStyle = 'rgba(7, 12, 15, 0.74)'
     context.fillRect(x, y + cellHeight - 58, cellWidth, 58)
-    context.fillStyle = '#ffffff'
+    context.fillStyle = '#fff'
     context.font = '600 22px system-ui, sans-serif'
     context.fillText(panoramas.value[index]?.name ?? `影像 ${index + 1}`, x + 22, y + cellHeight - 23)
-    context.fillStyle = '#ffb02e'
-    context.font = '600 18px ui-monospace, monospace'
-    const view = views.value[index] ?? DEFAULT_VIEW
-    context.fillText(
-      `AZ ${String(Math.round(view.yaw)).padStart(3, '0')}°  PITCH ${Math.round(view.pitch)}°  FOV ${Math.round(view.fov)}°`,
-      x + cellWidth - 390,
-      y + cellHeight - 24,
-    )
   })
 
   const blob = await canvasToBlob(canvas)
-  if (!blob) {
-    notify('对比图生成失败')
-    return
-  }
-
+  if (!blob) return notify('对比图生成失败')
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
@@ -277,16 +293,19 @@ async function exportComparison() {
 }
 
 async function toggleFullscreen() {
-  if (document.fullscreenElement) {
-    await document.exitFullscreen()
-  } else {
-    await document.documentElement.requestFullscreen()
-  }
+  if (document.fullscreenElement) await document.exitFullscreen()
+  else await document.documentElement.requestFullscreen()
 }
 
 function goBack() {
   if (window.history.length > 1) window.history.back()
   else notify('当前已是起始页面')
+}
+
+function selectMapImage(id: string) {
+  selectedMapId.value = id
+  const index = panoramas.value.findIndex((item) => item.id === id)
+  if (index >= 0) activeIndex.value = index
 }
 
 function handleFullscreenChange() {
@@ -295,12 +314,12 @@ function handleFullscreenChange() {
 
 onMounted(() => {
   document.addEventListener('fullscreenchange', handleFullscreenChange)
+  void loadCatalog(true)
 })
 
 onBeforeUnmount(() => {
   window.clearTimeout(toastTimer)
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
-  releaseObjectUrls(panoramas.value)
 })
 </script>
 
@@ -313,18 +332,38 @@ onBeforeUnmount(() => {
         </button>
         <div class="brand-mark" aria-hidden="true"><ScanLine :size="20" /></div>
         <div class="title-block">
-          <h1>全景影像对比</h1>
-          <p>桌面端多画面同步查看</p>
+          <h1>无人机全景影像工作台</h1>
+          <p>全景对比 · 地面反投影 · 天地图叠加</p>
         </div>
       </div>
 
-      <div class="header-actions">
-        <button type="button" class="primary-action" @click="openFilePicker">
-          <Upload :size="17" />
-          <span>上传全景</span>
+      <div class="workspace-switch" aria-label="工作模式">
+        <button
+          type="button"
+          :class="{ active: workspaceMode === 'panorama' }"
+          @click="workspaceMode = 'panorama'"
+        >
+          <GalleryHorizontalEnd :size="16" /> 全景视图
         </button>
-        <button class="icon-button" type="button" title="恢复示例" aria-label="恢复示例" @click="resetDemo">
-          <RotateCcw :size="17" />
+        <button
+          type="button"
+          :class="{ active: workspaceMode === 'orthophoto' }"
+          @click="workspaceMode = 'orthophoto'"
+        >
+          <Map :size="16" /> 正射地图
+        </button>
+      </div>
+
+      <div class="header-actions">
+        <button type="button" @click="libraryOpen = !libraryOpen">
+          <Database :size="17" />
+          <span>影像库</span>
+          <small>{{ library.length }}</small>
+        </button>
+        <button type="button" class="primary-action" :disabled="uploading" @click="openFilePicker">
+          <LoaderCircle v-if="uploading" class="spinner" :size="17" />
+          <Upload v-else :size="17" />
+          <span>{{ uploading ? '保存并处理' : '上传全景' }}</span>
         </button>
         <input
           ref="filePicker"
@@ -338,49 +377,125 @@ onBeforeUnmount(() => {
     </header>
 
     <div class="context-bar">
-      <div class="sync-state" :class="{ muted: !syncEnabled }">
+      <div class="sync-state" :class="{ muted: workspaceMode !== 'panorama' || !syncEnabled }">
         <span class="status-dot" />
-        {{ syncEnabled ? '视角同步中' : '独立视角' }}
+        {{ workspaceMode === 'panorama' ? (syncEnabled ? '视角同步中' : '独立视角') : '天地图影像底图' }}
       </div>
       <div class="context-divider" />
-      <div><Images :size="14" /> {{ panoramas.length }} 幅全景</div>
+      <div><Images :size="14" /> 当前 {{ panoramas.length }} 幅</div>
+      <div class="context-divider" />
+      <div><HardDriveUpload :size="14" /> 文件永久保存</div>
       <div class="context-spacer" />
-      <div>最多 {{ MAX_PANORAMAS }} 幅</div>
+      <div>{{ workspaceMode === 'orthophoto' ? '20 米内自动归为同位置候选' : `最多 ${MAX_PANORAMAS} 幅同步对比` }}</div>
     </div>
 
     <main class="workspace">
-      <section class="panorama-grid" :class="gridClass" aria-label="全景影像对比区">
-        <PanoramaViewer
-          v-for="(panorama, index) in panoramas"
-          :key="panorama.id"
-          :ref="(element) => setViewerRef(element, index)"
-          :image="panorama"
-          :view="views[index] ?? DEFAULT_VIEW"
-          :index="index"
-          :active="activeIndex === index"
-          :removable="panoramas.length > 1"
-          @activate="activeIndex = index"
-          @view-change="(view) => handleViewChange(index, view)"
-          @download="downloadOriginal(panorama)"
-          @remove="removePanorama(index)"
-        />
-      </section>
+      <div v-if="loadingCatalog" class="workspace-state">
+        <LoaderCircle class="spinner" :size="28" />
+        <strong>正在读取影像库</strong>
+      </div>
+
+      <div v-else-if="library.length === 0" class="workspace-state empty-state">
+        <div><Upload :size="30" /></div>
+        <strong>影像库为空</strong>
+        <span>上传大疆 2:1 全景图后，服务器会永久保存原图并生成地面反投影预览</span>
+        <button type="button" :disabled="uploading" @click="openFilePicker">选择全景图片</button>
+      </div>
+
+      <template v-else-if="workspaceMode === 'panorama'">
+        <div v-if="panoramas.length === 0" class="workspace-state empty-state">
+          <div><Images :size="30" /></div>
+          <strong>当前对比区为空</strong>
+          <span>从影像库选择 1 至 {{ MAX_PANORAMAS }} 幅影像</span>
+          <button type="button" @click="libraryOpen = true">打开影像库</button>
+        </div>
+        <section v-else class="panorama-grid" :class="gridClass" aria-label="全景影像对比区">
+          <PanoramaViewer
+            v-for="(panorama, index) in panoramas"
+            :key="panorama.id"
+            :ref="(element) => setViewerRef(element, index)"
+            :image="panorama"
+            :view="views[index] ?? DEFAULT_VIEW"
+            :index="index"
+            :active="activeIndex === index"
+            :removable="true"
+            @activate="activeIndex = index; selectedMapId = panorama.id"
+            @view-change="(view) => handleViewChange(index, view)"
+            @download="downloadOriginal(panorama)"
+            @remove="removePanorama(index)"
+          />
+        </section>
+      </template>
+
+      <OrthophotoMap
+        v-else
+        :images="library"
+        :selected-id="selectedMapId ?? library[0]?.id ?? null"
+        @select="selectMapImage"
+      />
+
+      <Transition name="drawer">
+        <aside v-if="libraryOpen" class="library-drawer" aria-label="永久影像库">
+          <div class="library-heading">
+            <div>
+              <strong>永久影像库</strong>
+              <span>{{ library.length }} 幅已保存影像</span>
+            </div>
+            <button type="button" title="关闭影像库" aria-label="关闭影像库" @click="libraryOpen = false">
+              <X :size="18" />
+            </button>
+          </div>
+          <div class="library-list">
+            <article v-for="item in library" :key="item.id" :class="{ selected: visibleIds.includes(item.id) }">
+              <img :src="item.orthophotoUrl ?? item.src" :alt="item.name" />
+              <div class="library-item-info">
+                <strong>{{ item.name }}</strong>
+                <span>{{ item.detail }}</span>
+                <small>{{ item.latitude === null ? '无 GPS' : 'GPS 已提取' }} · {{ item.orthophotoStatus === 'ready' ? '地面反投影就绪' : '无反投影预览' }}</small>
+              </div>
+              <div class="library-item-actions">
+                <button
+                  type="button"
+                  :class="{ active: visibleIds.includes(item.id) }"
+                  :title="visibleIds.includes(item.id) ? '移出当前对比' : '加入当前对比'"
+                  :aria-label="visibleIds.includes(item.id) ? '移出当前对比' : '加入当前对比'"
+                  @click="toggleLibraryItem(item.id)"
+                >
+                  <Check v-if="visibleIds.includes(item.id)" :size="16" />
+                  <Images v-else :size="16" />
+                </button>
+                <button type="button" title="下载原图" aria-label="下载原图" @click="downloadOriginal(item)">
+                  <Download :size="16" />
+                </button>
+                <button type="button" class="danger" title="永久删除" aria-label="永久删除" @click="permanentlyDelete(item)">
+                  <Trash2 :size="16" />
+                </button>
+              </div>
+            </article>
+          </div>
+        </aside>
+      </Transition>
     </main>
 
     <footer class="app-footer">
       <div class="active-view-label">
-        <span>活动画面</span>
-        <strong>{{ String(activeIndex + 1).padStart(2, '0') }}</strong>
+        <span>{{ workspaceMode === 'panorama' ? '活动画面' : '当前覆盖层' }}</span>
+        <strong>{{ activePanorama ? String(activeIndex + 1).padStart(2, '0') : '--' }}</strong>
       </div>
 
-      <div class="view-readout" aria-label="活动画面视角">
+      <div v-if="workspaceMode === 'panorama'" class="view-readout" aria-label="活动画面视角">
         <span>方位 <strong>{{ headingText }}°</strong></span>
         <span>俯仰 <strong>{{ pitchText }}</strong></span>
         <span>视场 <strong>{{ Math.round(activeView.fov) }}°</strong></span>
       </div>
+      <div v-else class="map-readout">
+        <span>覆盖类型</span>
+        <strong>500 m × 500 m</strong>
+        <small>非测绘正射成果</small>
+      </div>
 
       <div class="footer-actions">
-        <button type="button" :class="{ active: syncEnabled }" @click="toggleSync">
+        <button v-if="workspaceMode === 'panorama'" type="button" :class="{ active: syncEnabled }" @click="toggleSync">
           <Link2 v-if="syncEnabled" :size="17" />
           <Unlink v-else :size="17" />
           <span>视角同步</span>
@@ -390,7 +505,7 @@ onBeforeUnmount(() => {
           <Maximize2 v-else :size="17" />
           <span>{{ isFullscreen ? '退出全屏' : '全屏' }}</span>
         </button>
-        <button type="button" class="export-button" @click="exportComparison">
+        <button type="button" class="export-button" :disabled="panoramas.length === 0" @click="exportComparison">
           <Download :size="17" />
           <span>保存对比图</span>
         </button>
