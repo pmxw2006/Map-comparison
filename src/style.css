@@ -367,8 +367,17 @@ button {
 .library-heading strong { font-size: 13px; }
 .library-heading span { color: #7a878e; font-size: 10px; }
 
+.library-heading-actions {
+  display: flex !important;
+  align-items: center;
+  gap: 5px;
+}
+
 .library-heading button,
-.library-item-actions button {
+.library-item-actions button,
+.library-record-heading button,
+.library-region-row button,
+.library-region-toolbar button {
   display: grid;
   place-items: center;
   width: 34px;
@@ -381,10 +390,20 @@ button {
 }
 
 .library-heading button:hover,
-.library-item-actions button:hover {
+.library-item-actions button:hover,
+.library-record-heading button:hover,
+.library-region-row button:hover,
+.library-region-toolbar button:hover {
   color: #172027;
   background: #edf1f2;
   border-color: #d5dde0;
+}
+
+.library-heading button:disabled,
+.library-item-actions button:disabled,
+.library-region-toolbar button:disabled {
+  opacity: 0.48;
+  cursor: not-allowed;
 }
 
 .library-list {
@@ -393,25 +412,91 @@ button {
   padding: 10px;
 }
 
-.library-list article {
+.library-record {
   display: grid;
-  grid-template-columns: 86px minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 11px;
-  min-height: 82px;
-  padding: 8px;
+  gap: 8px;
+  padding: 9px;
   background: #fff;
   border: 1px solid #dce2e5;
 }
 
-.library-list article + article { margin-top: 7px; }
-.library-list article.selected { border-color: #e5a13a; box-shadow: inset 3px 0 #ffb02e; }
+.library-record + .library-record { margin-top: 8px; }
+.library-record.selected { border-color: #e5a13a; box-shadow: inset 3px 0 #ffb02e; }
 
-.library-list img {
-  width: 86px;
-  height: 62px;
+.library-record-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid #edf1f2;
+}
+
+.library-record-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.library-record-heading strong,
+.library-record-heading span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.library-record-heading strong { font-size: 11px; }
+.library-record-heading span { color: #7a878e; font-size: 9px; }
+
+.library-type-group {
+  display: grid;
+  gap: 5px;
+}
+
+.library-type-label {
+  display: inline-flex;
+  align-items: center;
+  width: fit-content;
+  min-height: 20px;
+  padding: 0 7px;
+  color: #7a4a09;
+  background: #fff7e6;
+  border: 1px solid #f2d29e;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.library-child-card {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 9px;
+  min-height: 70px;
+  padding: 6px;
+  background: #f7f9fa;
+  border: 1px solid #dfe6e9;
+}
+
+.library-child-card.is-empty {
+  grid-template-columns: 92px minmax(0, 1fr);
+  color: #87949c;
+  background: #f3f5f6;
+}
+
+.library-child-card img,
+.library-empty-preview {
+  width: 92px;
+  height: 58px;
   object-fit: cover;
   background: #182027;
+}
+
+.library-empty-preview {
+  display: grid;
+  place-items: center;
+  color: #a1adb4;
+  background: #e8edf0;
+  border: 1px dashed #c7d1d6;
 }
 
 .library-item-info {
@@ -443,10 +528,71 @@ button {
   border-color: #e39926;
 }
 
-.library-item-actions button.danger:hover {
+.library-record-heading button.danger:hover,
+.library-region-row button.danger:hover {
   color: #b42318;
   background: #fff1f0;
   border-color: #f0c0bc;
+}
+
+.library-region-downloads {
+  display: grid;
+  gap: 7px;
+  margin-top: 12px;
+  padding: 10px;
+  background: #fff;
+  border: 1px solid #dce2e5;
+}
+
+.library-region-toolbar,
+.library-region-row {
+  display: grid;
+  align-items: center;
+  gap: 7px;
+}
+
+.library-region-toolbar {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.library-region-toolbar span {
+  color: #7a878e;
+  font-size: 10px;
+}
+
+.library-region-toolbar button {
+  display: inline-flex;
+  width: auto;
+  padding: 0 9px;
+  gap: 5px;
+  font-size: 10px;
+}
+
+.library-region-row {
+  grid-template-columns: 28px 14px minmax(0, 1fr) 28px 28px;
+  min-height: 32px;
+  padding: 4px 5px;
+  background: #f7f9fa;
+  border: 1px solid #dfe6e9;
+}
+
+.library-region-row i {
+  width: 12px;
+  height: 12px;
+  border: 1px solid rgba(0, 0, 0, 0.25);
+}
+
+.library-region-row span {
+  overflow: hidden;
+  color: #53626b;
+  font-size: 10px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.library-region-row button {
+  width: 28px;
+  height: 28px;
 }
 
 .app-footer {

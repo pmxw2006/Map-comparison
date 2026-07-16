@@ -23,6 +23,7 @@ export interface PanoramaItem {
   orthophotoStatus: 'ready' | 'unsupported' | 'processing' | 'failed'
   orthophotoKind: 'nadir_preview' | 'survey_orthophoto' | null
   orthophotoUrl: string | null
+  orthophotoDownloadUrl: string | null
   overlayBounds: [[number, number], [number, number]] | null
   nearbyIds: string[]
 }
@@ -48,8 +49,18 @@ export interface StoredImageDto {
   orthophoto_status: PanoramaItem['orthophotoStatus']
   orthophoto_kind: PanoramaItem['orthophotoKind']
   orthophoto_url: string | null
+  orthophoto_download_url: string | null
   overlay_bounds: PanoramaItem['overlayBounds']
   nearby_ids: string[]
+}
+
+export interface MapRegion {
+  id: string
+  name: string
+  color: string
+  opacity: number
+  visible: boolean
+  points: Array<[number, number]>
 }
 
 export interface PanoramaViewerExpose {

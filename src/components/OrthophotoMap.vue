@@ -1,25 +1,53 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { ImageOff, Layers3, MapPin, Navigation } from '@lucide/vue'
-import L, { type ImageOverlay, type LayerGroup, type Map as LeafletMap } from 'leaflet'
+import { Eye, EyeOff, ImageOff, Layers3, MapPin, Navigation, PenTool, Trash2, Undo2, X } from '@lucide/vue'
+import L, {
+  type CircleMarker,
+  type ImageOverlay,
+  type LayerGroup,
+  type LeafletMouseEvent,
+  type Map as LeafletMap,
+  type Polygon,
+  type Polyline,
+} from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import type { PanoramaItem } from '../types/panorama'
+import type { MapRegion, PanoramaItem } from '../types/panorama'
 
 const props = defineProps<{
   images: PanoramaItem[]
   selectedId: string | null
+  visibleOrthophotoIds: string[]
+  regions: MapRegion[]
 }>()
 
 const emit = defineEmits<{
   select: [id: string]
+  'toggle-orthophoto': [id: string]
+  'regions-change': [regions: MapRegion[]]
 }>()
 
 const mapElement = ref<HTMLDivElement | null>(null)
+const drawing = ref(false)
+const draftPoints = ref<Array<[number, number]>>([])
+const regionColor = ref('#ff4d4f')
+const regionOpacity = ref(0.35)
+const regionName = ref('')
+const placeNames = ref<Record<string, string>>({})
+const resolvingPlaceIds = new Set<string>()
+
 let map: LeafletMap | null = null
 let markerLayer: LayerGroup | null = null
-let imageOverlay: ImageOverlay | null = null
+let regionLayer: LayerGroup | null = null
+let draftLayer: LayerGroup | null = null
+let draftLine: Polyline | null = null
+let draftPolygon: Polygon | null = null
+let orthophotoLayers = new Map<string, ImageOverlay>()
+let draftMarkers: CircleMarker[] = []
 
 const selected = computed(() => props.images.find((image) => image.id === props.selectedId) ?? null)
+const readyOrthophotos = computed(() =>
+  props.images.filter((image) => image.orthophotoUrl && image.overlayBounds),
+)
 const nearbyImages = computed(() => {
   if (!selected.value) return []
   // 后端已按 20 米阈值计算 nearbyIds；这里仅负责把候选列表呈现给用户选择。
@@ -27,14 +55,45 @@ const nearbyImages = computed(() => {
   return props.images.filter((image) => ids.has(image.id) && image.latitude !== null && image.longitude !== null)
 })
 
-function coordinateText(image: PanoramaItem) {
+function coordinateFallback(image: PanoramaItem) {
   if (image.latitude === null || image.longitude === null) return '未提取到 GPS'
   return `${image.latitude.toFixed(6)}, ${image.longitude.toFixed(6)}`
+}
+
+function placeText(image: PanoramaItem) {
+  if (image.latitude === null || image.longitude === null) return '未提取到 GPS'
+  const name = placeNames.value[image.id]
+  if (!name) return '正在推算地点...'
+  return name.includes(',') ? `靠近 ${name}` : `靠近 ${name}`
+}
+
+async function resolvePlaceName(image: PanoramaItem | null) {
+  if (!image || image.latitude === null || image.longitude === null) return
+  if (placeNames.value[image.id] || resolvingPlaceIds.has(image.id)) return
+  resolvingPlaceIds.add(image.id)
+  try {
+    const query = new URLSearchParams({
+      lat: String(image.latitude),
+      lng: String(image.longitude),
+    })
+    const response = await fetch(`/api/geocode/reverse?${query}`)
+    const payload = await response.json().catch(() => null)
+    const name = typeof payload?.name === 'string' && payload.name.trim() ? payload.name.trim() : coordinateFallback(image)
+    placeNames.value = { ...placeNames.value, [image.id]: name }
+  } catch {
+    placeNames.value = { ...placeNames.value, [image.id]: coordinateFallback(image) }
+  } finally {
+    resolvingPlaceIds.delete(image.id)
+  }
 }
 
 function projectionHeightText(image: PanoramaItem) {
   const height = `${Math.round(image.projectionAltitude)} m`
   return image.relativeAltitude === null ? `${height}（默认）` : height
+}
+
+function isOrthophotoVisible(id: string) {
+  return props.visibleOrthophotoIds.includes(id)
 }
 
 function rebuildMarkers() {
@@ -55,27 +114,173 @@ function rebuildMarkers() {
     })
     marker.on('click', () => emit('select', image.id))
     marker.bindTooltip(image.name, { direction: 'top', offset: [0, -30] })
-    marker.addTo(markers)
+    markers.addLayer(marker)
   })
 }
 
-function showSelectedOverlay(fit = false) {
+function fitSelectedOverlay() {
   if (!map) return
-  // Leaflet 的 imageOverlay 不能直接换图和边界；切换影像时先移除旧覆盖层再新建。
-  if (imageOverlay) {
-    imageOverlay.removeFrom(map)
-    imageOverlay = null
+  const image = selected.value
+  if (image?.overlayBounds) map.fitBounds(image.overlayBounds, { padding: [70, 70], maxZoom: 19 })
+}
+
+function rebuildOrthophotoOverlays(fit = false) {
+  if (!map) return
+  const activeMap = map
+  const ready = new Map(readyOrthophotos.value.map((image) => [image.id, image]))
+
+  for (const [id, layer] of orthophotoLayers) {
+    if (!props.visibleOrthophotoIds.includes(id) || !ready.has(id)) {
+      layer.removeFrom(activeMap)
+      orthophotoLayers.delete(id)
+    }
   }
 
-  const image = selected.value
-  if (!image?.orthophotoUrl || !image.overlayBounds) return
-  imageOverlay = L.imageOverlay(image.orthophotoUrl, image.overlayBounds, {
-    opacity: 0.86,
-    interactive: true,
-    zIndex: 5,
-  }).addTo(map)
-  imageOverlay.bindTooltip(`${image.name} · 500 m × 500 m 地面反投影`)
-  if (fit) map.fitBounds(image.overlayBounds, { padding: [70, 70], maxZoom: 19 })
+  props.visibleOrthophotoIds.forEach((id, index) => {
+    const image = ready.get(id)
+    if (!image?.orthophotoUrl || !image.overlayBounds || orthophotoLayers.has(id)) return
+    const overlay = L.imageOverlay(image.orthophotoUrl, image.overlayBounds, {
+      opacity: 0.82,
+      interactive: true,
+      pane: 'orthophotoPane',
+      zIndex: 20 + index,
+    }).addTo(activeMap)
+    const element = overlay.getElement()
+    element?.classList.add('orthophoto-overlay-image')
+    overlay.on('mouseover', () => overlay.getElement()?.classList.add('orthophoto-overlay-hover'))
+    overlay.on('mouseout', () => overlay.getElement()?.classList.remove('orthophoto-overlay-hover'))
+    orthophotoLayers.set(id, overlay)
+  })
+
+  if (fit) fitSelectedOverlay()
+}
+
+function rebuildRegionLayer() {
+  if (!regionLayer) return
+  const layer = regionLayer
+  layer.clearLayers()
+  props.regions
+    .filter((region) => region.visible && region.points.length >= 3)
+    .forEach((region) => {
+      layer.addLayer(L.polygon(region.points, {
+        pane: 'regionPane',
+        color: region.color,
+        fillColor: region.color,
+        fillOpacity: region.opacity,
+        opacity: 0.95,
+        weight: 2,
+        interactive: false,
+      }))
+      region.points.forEach((point) => {
+        layer.addLayer(L.circleMarker(point, {
+          pane: 'regionPane',
+          radius: 4,
+          color: '#fff',
+          fillColor: region.color,
+          fillOpacity: 1,
+          opacity: 1,
+          weight: 2,
+          interactive: false,
+        }))
+      })
+    })
+}
+
+function redrawDraft() {
+  if (!draftLayer) return
+  const layer = draftLayer
+  if (draftLine) layer.removeLayer(draftLine)
+  if (draftPolygon) layer.removeLayer(draftPolygon)
+  draftMarkers.forEach((marker) => layer.removeLayer(marker))
+  draftMarkers = []
+
+  if (draftPoints.value.length >= 2) {
+    draftLine = L.polyline(draftPoints.value, {
+      pane: 'regionPane',
+      color: regionColor.value,
+      weight: 2,
+      dashArray: '6 5',
+    })
+    layer.addLayer(draftLine)
+  }
+  if (draftPoints.value.length >= 3) {
+    draftPolygon = L.polygon(draftPoints.value, {
+      pane: 'regionPane',
+      color: regionColor.value,
+      fillColor: regionColor.value,
+      fillOpacity: regionOpacity.value,
+      weight: 2,
+    })
+    layer.addLayer(draftPolygon)
+  }
+  draftMarkers = draftPoints.value.map((point) =>
+    L.circleMarker(point, {
+      pane: 'regionPane',
+      radius: 4,
+      color: '#fff',
+      fillColor: regionColor.value,
+      fillOpacity: 1,
+      weight: 2,
+    }),
+  )
+  draftMarkers.forEach((marker) => layer.addLayer(marker))
+}
+
+function startDrawing() {
+  drawing.value = true
+  draftPoints.value = []
+  map?.doubleClickZoom.disable()
+  redrawDraft()
+}
+
+function stopDrawing() {
+  drawing.value = false
+  draftPoints.value = []
+  map?.doubleClickZoom.enable()
+  redrawDraft()
+}
+
+function handleMapClick(event: LeafletMouseEvent) {
+  if (!drawing.value) return
+  draftPoints.value = [...draftPoints.value, [event.latlng.lat, event.latlng.lng]]
+  redrawDraft()
+}
+
+function handleMapDoubleClick(event: LeafletMouseEvent) {
+  if (!drawing.value) return
+  L.DomEvent.stop(event)
+  finishDrawing()
+}
+
+function undoDraftPoint() {
+  draftPoints.value = draftPoints.value.slice(0, -1)
+  redrawDraft()
+}
+
+function finishDrawing() {
+  if (draftPoints.value.length < 3) return
+  const nextRegion: MapRegion = {
+    id: crypto.randomUUID(),
+    name: regionName.value.trim() || `区域 ${props.regions.length + 1}`,
+    color: regionColor.value,
+    opacity: regionOpacity.value,
+    visible: true,
+    points: draftPoints.value,
+  }
+  emit('regions-change', [...props.regions, nextRegion])
+  regionName.value = ''
+  stopDrawing()
+}
+
+function updateRegion(id: string, patch: Partial<MapRegion>) {
+  emit(
+    'regions-change',
+    props.regions.map((region) => (region.id === id ? { ...region, ...patch } : region)),
+  )
+}
+
+function deleteRegion(id: string) {
+  emit('regions-change', props.regions.filter((region) => region.id !== id))
 }
 
 onMounted(async () => {
@@ -90,6 +295,8 @@ onMounted(async () => {
     zoomControl: true,
     attributionControl: false,
   })
+  map.createPane('orthophotoPane').style.zIndex = '420'
+  map.createPane('regionPane').style.zIndex = '680'
 
   const token = import.meta.env.VITE_TIANDITU_TOKEN ?? ''
   const subdomains = ['0', '1', '2', '3', '4', '5', '6', '7']
@@ -104,16 +311,28 @@ onMounted(async () => {
   ).addTo(map)
 
   markerLayer = L.layerGroup().addTo(map)
+  regionLayer = L.layerGroup().addTo(map)
+  draftLayer = L.layerGroup().addTo(map)
+  map.on('click', handleMapClick)
+  map.on('dblclick', handleMapDoubleClick)
   rebuildMarkers()
-  showSelectedOverlay(true)
+  rebuildOrthophotoOverlays(true)
+  rebuildRegionLayer()
+  void resolvePlaceName(selected.value)
 })
 
 watch(
   () => props.images,
   () => {
     rebuildMarkers()
-    showSelectedOverlay(false)
+    rebuildOrthophotoOverlays(false)
   },
+  { deep: true },
+)
+
+watch(
+  () => props.visibleOrthophotoIds,
+  () => rebuildOrthophotoOverlays(false),
   { deep: true },
 )
 
@@ -121,11 +340,28 @@ watch(
   () => props.selectedId,
   () => {
     rebuildMarkers()
-    showSelectedOverlay(true)
+    rebuildOrthophotoOverlays(true)
+    void resolvePlaceName(selected.value)
   },
 )
 
+watch(
+  () => props.images,
+  () => void resolvePlaceName(selected.value),
+  { deep: true },
+)
+
+watch(
+  () => props.regions,
+  () => rebuildRegionLayer(),
+  { deep: true },
+)
+
+watch([regionColor, regionOpacity], () => redrawDraft())
+
 onBeforeUnmount(() => {
+  map?.off('click', handleMapClick)
+  map?.off('dblclick', handleMapDoubleClick)
   map?.remove()
   map = null
 })
@@ -133,14 +369,14 @@ onBeforeUnmount(() => {
 
 <template>
   <section class="orthophoto-workspace" aria-label="正射地图查看区">
-    <div ref="mapElement" class="orthophoto-map" />
+    <div ref="mapElement" class="orthophoto-map" :class="{ drawing }" />
 
     <div class="map-status-panel">
       <div class="map-status-heading">
         <span><Layers3 :size="17" /></span>
         <div>
           <strong>{{ selected?.name ?? '尚未选择影像' }}</strong>
-          <small>{{ selected ? coordinateText(selected) : '从影像库添加影像' }}</small>
+          <small>{{ selected ? placeText(selected) : '从影像库添加影像' }}</small>
         </div>
       </div>
 
@@ -171,20 +407,97 @@ onBeforeUnmount(() => {
       </template>
     </div>
 
+    <div class="layer-panel">
+      <div class="tool-heading">
+        <strong>正射图层</strong>
+        <span>{{ visibleOrthophotoIds.length }} / {{ readyOrthophotos.length }}</span>
+      </div>
+      <div class="orthophoto-layer-list">
+        <label v-for="image in readyOrthophotos" :key="image.id" :class="{ active: isOrthophotoVisible(image.id) }">
+          <input
+            type="checkbox"
+            :checked="isOrthophotoVisible(image.id)"
+            @change="emit('toggle-orthophoto', image.id)"
+          />
+          <span>{{ image.name }}</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="region-panel">
+      <div class="tool-heading">
+        <strong>区域图层</strong>
+        <span>下载在影像库内</span>
+      </div>
+
+      <div class="draw-controls">
+        <input v-model="regionName" type="text" placeholder="区域名称" />
+        <div class="region-style-row">
+          <input v-model="regionColor" type="color" title="区域颜色" aria-label="区域颜色" />
+          <label>
+            <span>透明度 {{ Math.round(regionOpacity * 100) }}%</span>
+            <input v-model.number="regionOpacity" type="range" min="0.05" max="0.9" step="0.05" />
+          </label>
+        </div>
+        <div class="draw-buttons">
+          <button v-if="!drawing" type="button" @click="startDrawing"><PenTool :size="14" /> 开始描绘</button>
+          <template v-else>
+            <button type="button" :disabled="draftPoints.length < 3" @click="finishDrawing">保存当前</button>
+            <button type="button" :disabled="draftPoints.length === 0" title="撤销上一点" aria-label="撤销上一点" @click="undoDraftPoint">
+              <Undo2 :size="14" />
+            </button>
+            <button type="button" title="取消描绘" aria-label="取消描绘" @click="stopDrawing">
+              <X :size="14" />
+            </button>
+          </template>
+        </div>
+        <small v-if="drawing" class="draw-hint">双击鼠标左键结束描绘并保存。</small>
+      </div>
+
+      <div class="region-list">
+        <article v-for="region in regions" :key="region.id">
+          <button
+            type="button"
+            :title="region.visible ? '隐藏区域' : '显示区域'"
+            :aria-label="region.visible ? '隐藏区域' : '显示区域'"
+            @click="updateRegion(region.id, { visible: !region.visible })"
+          >
+            <Eye v-if="region.visible" :size="14" />
+            <EyeOff v-else :size="14" />
+          </button>
+          <input :value="region.name" @change="updateRegion(region.id, { name: ($event.target as HTMLInputElement).value })" />
+          <input :value="region.color" type="color" @input="updateRegion(region.id, { color: ($event.target as HTMLInputElement).value })" />
+          <input
+            :value="region.opacity"
+            type="range"
+            min="0.05"
+            max="0.9"
+            step="0.05"
+            title="透明度"
+            aria-label="透明度"
+            @input="updateRegion(region.id, { opacity: Number(($event.target as HTMLInputElement).value) })"
+          />
+          <button type="button" class="danger" title="删除区域" aria-label="删除区域" @click="deleteRegion(region.id)">
+            <Trash2 :size="14" />
+          </button>
+        </article>
+      </div>
+    </div>
+
     <div
       v-if="selected && (selected.latitude === null || selected.longitude === null)"
       class="unlocated-preview"
     >
-      <img v-if="selected.orthophotoUrl" :src="selected.orthophotoUrl" :alt="`${selected.name}地面反投影预览`" />
-      <ImageOff v-else :size="34" />
+      <ImageOff :size="34" />
       <div>
         <strong>{{ selected.orthophotoUrl ? '500 m × 500 m 地面反投影已生成' : '无法生成地面反投影' }}</strong>
-        <span>原图没有可用 GPS，暂时不能覆盖到天地图</span>
+        <span>原图没有可用 GPS，暂时不能覆盖到天地图；图片预览与下载请到影像库查看</span>
       </div>
     </div>
 
     <div class="map-legend">
-      <span><i class="legend-overlay" /> 当前正射预览</span>
+      <span><i class="legend-overlay" /> 正射图层</span>
+      <span><i class="legend-region" /> 区域图层</span>
       <span><i class="legend-point" /> 全景拍摄点</span>
     </div>
   </section>
@@ -206,11 +519,17 @@ onBeforeUnmount(() => {
   z-index: 0;
 }
 
+.orthophoto-map.drawing {
+  cursor: crosshair;
+}
+
 .map-status-panel,
+.layer-panel,
+.region-panel,
 .map-legend,
 .unlocated-preview {
   position: absolute;
-  z-index: 500;
+  z-index: 700;
   color: #172027;
   background: rgba(255, 255, 255, 0.96);
   border: 1px solid #cbd3d7;
@@ -280,7 +599,8 @@ onBeforeUnmount(() => {
   border-top: 1px solid #e0e5e7;
 }
 
-.nearby-selector > span {
+.nearby-selector > span,
+.tool-heading span {
   color: #7a858c;
   font-size: 10px;
 }
@@ -291,9 +611,17 @@ onBeforeUnmount(() => {
   margin-top: 8px;
 }
 
-.nearby-selector button {
+.nearby-selector button,
+.draw-buttons button,
+.tool-heading button,
+.region-list button,
+.orthophoto-layer-list button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
   height: 28px;
-  padding: 0 10px;
+  padding: 0 9px;
   color: #46545d;
   background: #f4f6f7;
   border: 1px solid #d8dee1;
@@ -307,22 +635,156 @@ onBeforeUnmount(() => {
   border-color: #e99b1f;
 }
 
+.layer-panel {
+  top: 18px;
+  right: 18px;
+  width: 300px;
+  padding: 12px;
+}
+
+.region-panel {
+  top: 210px;
+  right: 18px;
+  display: grid;
+  gap: 10px;
+  width: 300px;
+  max-height: calc(100% - 286px);
+  padding: 12px;
+}
+
+.tool-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.tool-heading strong {
+  font-size: 12px;
+}
+
+.orthophoto-layer-list,
+.region-list {
+  display: grid;
+  gap: 6px;
+  max-height: 180px;
+  margin-top: 9px;
+  overflow: auto;
+}
+
+.orthophoto-layer-list label {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-height: 32px;
+  padding: 4px 5px 4px 8px;
+  background: #f7f9fa;
+  border: 1px solid #dde4e7;
+  font-size: 10px;
+}
+
+.orthophoto-layer-list label.active {
+  border-color: #e5a13a;
+  box-shadow: inset 3px 0 #ffb02e;
+}
+
+.orthophoto-layer-list span {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.draw-controls {
+  display: grid;
+  gap: 8px;
+  padding-top: 9px;
+  border-top: 1px solid #e0e5e7;
+}
+
+.draw-controls input[type='text'],
+.region-list input[type='text'],
+.region-list input:not([type]) {
+  min-width: 0;
+  height: 30px;
+  padding: 0 8px;
+  border: 1px solid #d7dee2;
+  font-size: 10px;
+}
+
+.region-style-row {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+}
+
+.region-style-row input[type='color'],
+.region-list input[type='color'] {
+  width: 30px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid #d7dee2;
+}
+
+.region-style-row label {
+  display: grid;
+  gap: 3px;
+  color: #70808a;
+  font-size: 9px;
+}
+
+.draw-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+.draw-buttons button:first-child {
+  flex: 1;
+}
+
+.draw-hint {
+  color: #a26a18;
+  font-size: 9px;
+}
+
+.draw-buttons button:disabled,
+.region-list button:disabled {
+  opacity: 0.52;
+  cursor: not-allowed;
+}
+
+.region-list {
+  max-height: 260px;
+}
+
+.region-list article {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr) 30px 56px 28px;
+  align-items: center;
+  gap: 5px;
+}
+
+.region-list input[type='range'] {
+  min-width: 0;
+}
+
+.region-list .danger:hover {
+  color: #b42318;
+  background: #fff1f0;
+  border-color: #f0c0bc;
+}
+
 .unlocated-preview {
   top: 50%;
   left: 50%;
   display: grid;
-  grid-template-columns: 220px 1fr;
+  grid-template-columns: 74px 1fr;
   align-items: center;
-  width: 500px;
-  min-height: 190px;
+  width: 430px;
+  min-height: 126px;
   overflow: hidden;
   transform: translate(-50%, -50%);
-}
-
-.unlocated-preview img {
-  width: 220px;
-  height: 190px;
-  object-fit: cover;
 }
 
 .unlocated-preview > svg {
@@ -352,6 +814,7 @@ onBeforeUnmount(() => {
 .map-legend span { display: flex; align-items: center; gap: 6px; }
 .map-legend i { display: inline-block; width: 10px; height: 10px; }
 .legend-overlay { background: rgba(255, 176, 46, 0.82); border: 1px solid #c97807; }
+.legend-region { background: rgba(255, 77, 79, 0.35); border: 1px solid #ff4d4f; }
 .legend-point { border-radius: 50%; background: #26353e; border: 2px solid #fff; }
 
 :global(.image-map-marker-host) { background: transparent; border: 0; }
@@ -370,4 +833,13 @@ onBeforeUnmount(() => {
 }
 :global(.image-map-marker b) { transform: rotate(45deg); }
 :global(.image-map-marker.is-selected) { color: #171c1f; background: #ffb02e; }
+:global(.orthophoto-overlay-image) {
+  outline: 0 solid transparent;
+  outline-offset: -2px;
+  transition: outline-color 120ms ease, outline-width 120ms ease, filter 120ms ease;
+}
+:global(.orthophoto-overlay-hover) {
+  outline: 3px solid #ffb02e;
+  filter: saturate(1.08) contrast(1.03);
+}
 </style>

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { Download, LoaderCircle, Navigation, RotateCcw, Trash2, ZoomIn, ZoomOut } from '@lucide/vue'
+import { LoaderCircle, Navigation, PenTool, RotateCcw, Trash2, Undo2, X, ZoomIn, ZoomOut } from '@lucide/vue'
 import {
   MathUtils,
   Mesh,
@@ -14,7 +14,7 @@ import {
   Vector3,
   WebGLRenderer,
 } from 'three'
-import type { PanoramaItem, ViewState } from '../types/panorama'
+import type { MapRegion, PanoramaItem, ViewState } from '../types/panorama'
 
 const props = defineProps<{
   image: PanoramaItem
@@ -22,12 +22,14 @@ const props = defineProps<{
   index: number
   active: boolean
   removable: boolean
+  regions: MapRegion[]
 }>()
 
 const emit = defineEmits<{
   activate: []
   'view-change': [view: ViewState]
-  download: []
+  'region-create': [region: MapRegion]
+  notice: [message: string]
   remove: []
 }>()
 
@@ -35,7 +37,13 @@ const stage = ref<HTMLDivElement | null>(null)
 const loading = ref(true)
 const loadError = ref(false)
 const dragging = ref(false)
+const drawing = ref(false)
+const draftPoints = ref<Array<[number, number]>>([])
+const regionColor = ref('#ff4d4f')
+const regionOpacity = ref(0.35)
+const regionName = ref('')
 const localView = reactive<ViewState>({ ...props.view })
+const stageSize = reactive({ width: 0, height: 0 })
 
 let scene: Scene | null = null
 let camera: PerspectiveCamera | null = null
@@ -60,10 +68,186 @@ const pitchText = computed(() => {
   return `${pitch > 0 ? '+' : ''}${pitch}`
 })
 const headingText = computed(() => String(heading.value).padStart(3, '0'))
+const canDrawOnPanorama = computed(() => props.image.latitude !== null && props.image.longitude !== null)
 const cardinal = computed(() => {
   const points = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
   return points[Math.round(heading.value / 45) % points.length]
 })
+
+const visibleRegionPolygons = computed(() => {
+  if (!stageSize.width || !stageSize.height) return []
+  return props.regions
+    .filter((region) => region.visible && region.points.length >= 3)
+    .map((region) => {
+      const points = region.points
+        .map((point) => projectRegionPoint(point))
+        .filter(Boolean) as Array<{ x: number; y: number }>
+      return { region, count: points.length, points: points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ') }
+    })
+    .filter((item) => item.count >= 3)
+})
+
+const visibleRegionMarkers = computed(() => {
+  if (!stageSize.width || !stageSize.height) return []
+  return props.regions
+    .filter((region) => region.visible)
+    .flatMap((region) =>
+      region.points
+        .map((point, pointIndex) => {
+          const projected = projectRegionPoint(point)
+          if (!projected) return null
+          return {
+            id: `${region.id}-${pointIndex}`,
+            region,
+            x: projected.x,
+            y: projected.y,
+          }
+        })
+        .filter(Boolean),
+    ) as Array<{ id: string; region: MapRegion; x: number; y: number }>
+})
+
+const draftScreenPoints = computed(() => {
+  if (!stageSize.width || !stageSize.height) return ''
+  const points = draftPoints.value
+    .map((point) => projectRegionPoint(point))
+    .filter(Boolean) as Array<{ x: number; y: number }>
+  return points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')
+})
+
+const draftScreenMarkers = computed(() => {
+  if (!stageSize.width || !stageSize.height) return []
+  return draftPoints.value
+    .map((point, pointIndex) => {
+      const projected = projectRegionPoint(point)
+      return projected ? { id: `draft-${pointIndex}`, x: projected.x, y: projected.y } : null
+    })
+    .filter(Boolean) as Array<{ id: string; x: number; y: number }>
+})
+
+function yawPitchToWorld(yaw: number, pitch: number, distance = 500) {
+  const phi = MathUtils.degToRad(90 - pitch)
+  const theta = MathUtils.degToRad(yaw)
+  return new Vector3(
+    distance * Math.sin(phi) * Math.cos(theta),
+    distance * Math.cos(phi),
+    distance * Math.sin(phi) * Math.sin(theta),
+  )
+}
+
+function groundPointToWorld(point: [number, number]) {
+  if (props.image.latitude === null || props.image.longitude === null) return null
+  const latitudeScale = 111_320
+  const longitudeScale = 111_320 * Math.max(0.1, Math.cos(MathUtils.degToRad(props.image.latitude)))
+  const north = (point[0] - props.image.latitude) * latitudeScale
+  const east = (point[1] - props.image.longitude) * longitudeScale
+  const groundDistance = Math.hypot(east, north)
+  const bearing = normalizeAngle(MathUtils.radToDeg(Math.atan2(east, north)))
+  const targetYaw = normalizeAngle(bearing - props.image.northOffset)
+  const targetPitch = -MathUtils.radToDeg(Math.atan2(props.image.projectionAltitude, groundDistance))
+  return yawPitchToWorld(targetYaw, targetPitch)
+}
+
+function projectRegionPoint(point: [number, number]) {
+  if (!camera) return null
+  const worldPoint = groundPointToWorld(point)
+  if (!worldPoint) return null
+
+  // 区域贴附使用和 WebGL 全景相同的相机矩阵；旋转视角时，点会锁定在同一个真实方位上。
+  updateCamera()
+  camera.updateMatrixWorld(true)
+  const cameraForward = new Vector3()
+  camera.getWorldDirection(cameraForward)
+  if (worldPoint.clone().normalize().dot(cameraForward) <= 0.02) return null
+
+  const projected = worldPoint.clone().project(camera)
+  if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y)) return null
+  if (Math.abs(projected.x) > 8 || Math.abs(projected.y) > 8) return null
+
+  return {
+    x: ((projected.x + 1) / 2) * stageSize.width,
+    y: ((1 - projected.y) / 2) * stageSize.height,
+  }
+}
+
+function screenToGroundPoint(clientX: number, clientY: number): [number, number] | null {
+  if (!stage.value || !camera || props.image.latitude === null || props.image.longitude === null) return null
+  const bounds = stage.value.getBoundingClientRect()
+  if (bounds.width < 1 || bounds.height < 1) return null
+
+  const x = clientX - bounds.left
+  const y = clientY - bounds.top
+  updateCamera()
+  camera.updateMatrixWorld(true)
+
+  // 鼠标屏幕点先反投影为当前相机射线，再和“相机下方的平坦地面”求交。
+  const rayPoint = new Vector3((x / bounds.width) * 2 - 1, -(y / bounds.height) * 2 + 1, 0.5).unproject(camera)
+  const direction = rayPoint.sub(camera.position).normalize()
+  const targetPitch = MathUtils.radToDeg(Math.asin(direction.y))
+
+  // 单张全景只能把屏幕点反算到“平坦地面”上；视线接近天空/地平线时没有稳定的落地点。
+  if (targetPitch >= -0.5) return null
+
+  const groundDistance = props.image.projectionAltitude / Math.tan(MathUtils.degToRad(-targetPitch))
+  if (!Number.isFinite(groundDistance) || groundDistance <= 0) return null
+
+  const targetYaw = normalizeAngle(MathUtils.radToDeg(Math.atan2(direction.z, direction.x)))
+  const bearing = normalizeAngle(targetYaw + props.image.northOffset)
+  const east = groundDistance * Math.sin(MathUtils.degToRad(bearing))
+  const north = groundDistance * Math.cos(MathUtils.degToRad(bearing))
+  const latitudeScale = 111_320
+  const longitudeScale = 111_320 * Math.max(0.1, Math.cos(MathUtils.degToRad(props.image.latitude)))
+  return [props.image.latitude + north / latitudeScale, props.image.longitude + east / longitudeScale]
+}
+
+function startDrawing() {
+  if (!canDrawOnPanorama.value) {
+    emit('notice', '当前全景没有 GPS，无法描绘地理区域')
+    return
+  }
+  drawing.value = true
+  dragging.value = false
+  pointerId = null
+  draftPoints.value = []
+  emit('activate')
+  stage.value?.focus({ preventScroll: true })
+}
+
+function stopDrawing() {
+  drawing.value = false
+  draftPoints.value = []
+}
+
+function undoDraftPoint() {
+  draftPoints.value = draftPoints.value.slice(0, -1)
+}
+
+function addDraftPoint(event: PointerEvent) {
+  const point = screenToGroundPoint(event.clientX, event.clientY)
+  if (!point) {
+    emit('notice', '请在全景中的地面方向描绘，天空或远处地平线无法稳定贴合')
+    return
+  }
+  draftPoints.value = [...draftPoints.value, point]
+}
+
+function finishDrawing() {
+  if (draftPoints.value.length < 3) {
+    emit('notice', '至少需要 3 个点才能保存区域')
+    return
+  }
+  const nextRegion: MapRegion = {
+    id: crypto.randomUUID(),
+    name: regionName.value.trim() || `全景区域 ${Date.now().toString().slice(-4)}`,
+    color: regionColor.value,
+    opacity: regionOpacity.value,
+    visible: true,
+    points: [...draftPoints.value],
+  }
+  emit('region-create', nextRegion)
+  regionName.value = ''
+  stopDrawing()
+}
 
 // 将经纬式的 yaw / pitch 转换成球心向外的观察向量。
 function updateCamera() {
@@ -72,14 +256,7 @@ function updateCamera() {
   camera.fov = localView.fov
   camera.updateProjectionMatrix()
 
-  const phi = MathUtils.degToRad(90 - localView.pitch)
-  const theta = MathUtils.degToRad(localView.yaw)
-  const target = new Vector3(
-    500 * Math.sin(phi) * Math.cos(theta),
-    500 * Math.cos(phi),
-    500 * Math.sin(phi) * Math.sin(theta),
-  )
-  camera.lookAt(target)
+  camera.lookAt(yawPitchToWorld(localView.yaw, localView.pitch))
 }
 
 function renderNow() {
@@ -109,6 +286,8 @@ function resizeRenderer() {
   if (!stage.value || !renderer || !camera) return
   const { width, height } = stage.value.getBoundingClientRect()
   if (width < 1 || height < 1) return
+  stageSize.width = width
+  stageSize.height = height
 
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75))
   renderer.setSize(width, height, false)
@@ -153,6 +332,12 @@ function loadTexture(source: string) {
 
 function onPointerDown(event: PointerEvent) {
   if (event.button !== 0) return
+  if (drawing.value) {
+    event.preventDefault()
+    emit('activate')
+    addDraftPoint(event)
+    return
+  }
   pointerId = event.pointerId
   dragging.value = true
   dragStartX = event.clientX
@@ -165,6 +350,7 @@ function onPointerDown(event: PointerEvent) {
 }
 
 function onPointerMove(event: PointerEvent) {
+  if (drawing.value) return
   if (!dragging.value || pointerId !== event.pointerId) return
   // 拖拽只更新当前查看器的视角；父组件根据“视角同步”开关决定是否广播给其他全景。
   publishView({
@@ -174,6 +360,7 @@ function onPointerMove(event: PointerEvent) {
 }
 
 function finishPointer(event: PointerEvent) {
+  if (drawing.value) return
   if (pointerId !== event.pointerId) return
   if (stage.value?.hasPointerCapture(event.pointerId)) stage.value.releasePointerCapture(event.pointerId)
   pointerId = null
@@ -182,6 +369,7 @@ function finishPointer(event: PointerEvent) {
 
 function onWheel(event: WheelEvent) {
   event.preventDefault()
+  if (drawing.value) return
   emit('activate')
   publishView({ fov: localView.fov + Math.sign(event.deltaY) * 4 })
 }
@@ -202,6 +390,19 @@ function resetView() {
 }
 
 function onKeydown(event: KeyboardEvent) {
+  if (drawing.value) {
+    if (event.key === 'Escape') {
+      event.preventDefault()
+      stopDrawing()
+    } else if (event.key === 'Backspace') {
+      event.preventDefault()
+      undoDraftPoint()
+    } else if (event.key === 'Enter') {
+      event.preventDefault()
+      finishDrawing()
+    }
+    return
+  }
   const controls: Record<string, () => void> = {
     ArrowLeft: () => publishView({ yaw: localView.yaw - 4 }),
     ArrowRight: () => publishView({ yaw: localView.yaw + 4 }),
@@ -218,6 +419,13 @@ function onKeydown(event: KeyboardEvent) {
   event.preventDefault()
   emit('activate')
   action()
+}
+
+function onDoubleClick(event: MouseEvent) {
+  if (!drawing.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  finishDrawing()
 }
 
 onMounted(async () => {
@@ -268,7 +476,10 @@ watch(
 
 watch(
   () => props.image.src,
-  (source) => loadTexture(source),
+  (source) => {
+    stopDrawing()
+    loadTexture(source)
+  },
 )
 
 onBeforeUnmount(() => {
@@ -289,7 +500,7 @@ defineExpose({
 </script>
 
 <template>
-  <article class="panorama-panel" :class="{ 'is-active': active, 'is-dragging': dragging }">
+  <article class="panorama-panel" :class="{ 'is-active': active, 'is-dragging': dragging, 'is-drawing': drawing }">
     <div
       ref="stage"
       class="panorama-stage"
@@ -302,6 +513,7 @@ defineExpose({
       @pointercancel="finishPointer"
       @wheel="onWheel"
       @keydown="onKeydown"
+      @dblclick="onDoubleClick"
     >
       <div class="image-shade image-shade-top" aria-hidden="true" />
       <div class="image-shade image-shade-bottom" aria-hidden="true" />
@@ -341,14 +553,81 @@ defineExpose({
         </button>
       </div>
 
+      <div class="draw-tools" @pointerdown.stop @dblclick.stop>
+        <template v-if="!drawing">
+          <button type="button" title="全景描绘" aria-label="全景描绘" @click="startDrawing">
+            <PenTool :size="16" />
+            <span>描绘</span>
+          </button>
+        </template>
+        <template v-else>
+          <input v-model="regionName" type="text" placeholder="区域名称" aria-label="区域名称" />
+          <input v-model="regionColor" type="color" title="区域颜色" aria-label="区域颜色" />
+          <label title="区域透明度">
+            {{ Math.round(regionOpacity * 100) }}%
+            <input v-model.number="regionOpacity" type="range" min="0.05" max="0.9" step="0.05" />
+          </label>
+          <button type="button" :disabled="draftPoints.length === 0" title="撤销上一点" aria-label="撤销上一点" @click="undoDraftPoint">
+            <Undo2 :size="15" />
+          </button>
+          <button type="button" title="取消描绘" aria-label="取消描绘" @click="stopDrawing">
+            <X :size="15" />
+          </button>
+          <small>左键点选，双击结束</small>
+        </template>
+      </div>
+
       <div class="view-reticle" aria-hidden="true"><span /></div>
+
+      <svg
+        v-if="visibleRegionPolygons.length || visibleRegionMarkers.length || draftScreenPoints || draftScreenMarkers.length"
+        class="region-screen-layer"
+        :viewBox="`0 0 ${stageSize.width} ${stageSize.height}`"
+        aria-hidden="true"
+      >
+        <polygon
+          v-for="item in visibleRegionPolygons"
+          :key="item.region.id"
+          :points="item.points"
+          :fill="item.region.color"
+          :fill-opacity="item.region.opacity"
+          :stroke="item.region.color"
+        />
+        <g
+          v-for="marker in visibleRegionMarkers"
+          :key="marker.id"
+          class="region-point-marker"
+          :style="{ color: marker.region.color }"
+        >
+          <circle :cx="marker.x" :cy="marker.y" r="5" />
+        </g>
+        <polygon
+          v-if="draftPoints.length >= 3 && draftScreenPoints"
+          :points="draftScreenPoints"
+          :fill="regionColor"
+          :fill-opacity="regionOpacity"
+          :stroke="regionColor"
+          class="draft-region"
+        />
+        <polyline
+          v-else-if="draftPoints.length >= 2 && draftScreenPoints"
+          :points="draftScreenPoints"
+          :stroke="regionColor"
+          class="draft-line"
+        />
+        <g
+          v-for="marker in draftScreenMarkers"
+          :key="marker.id"
+          class="region-point-marker draft-point-marker"
+          :style="{ color: regionColor }"
+        >
+          <circle :cx="marker.x" :cy="marker.y" r="5" />
+        </g>
+      </svg>
 
       <div class="panel-footer-overlay">
         <span>{{ image.detail }}</span>
         <div @pointerdown.stop>
-          <button type="button" title="下载原图" aria-label="下载原图" @click="emit('download')">
-            <Download :size="17" />
-          </button>
           <button
             v-if="removable"
             type="button"
@@ -402,6 +681,10 @@ defineExpose({
   cursor: grabbing;
 }
 
+.is-drawing .panorama-stage {
+  cursor: crosshair;
+}
+
 .panorama-stage:focus-visible {
   box-shadow: inset 0 0 0 3px rgba(255, 176, 46, 0.9);
 }
@@ -436,11 +719,54 @@ defineExpose({
 .panel-heading,
 .orientation-hud,
 .view-tools,
+.draw-tools,
 .view-reticle,
+.region-screen-layer,
 .panel-footer-overlay,
 .load-state {
   position: absolute;
   z-index: 2;
+}
+
+.region-screen-layer {
+  z-index: 3;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.region-screen-layer polygon {
+  stroke-width: 3px;
+  vector-effect: non-scaling-stroke;
+  paint-order: stroke fill;
+}
+
+.region-screen-layer .draft-region,
+.region-screen-layer .draft-line {
+  stroke-width: 3px;
+  stroke-dasharray: 7 5;
+  vector-effect: non-scaling-stroke;
+}
+
+.region-screen-layer .draft-line {
+  fill: none;
+}
+
+.region-point-marker {
+  color: #ff4d4f;
+}
+
+.region-point-marker circle {
+  fill: currentColor;
+  stroke: #fff;
+  stroke-width: 2px;
+  vector-effect: non-scaling-stroke;
+  paint-order: stroke fill;
+}
+
+.draft-point-marker circle {
+  stroke-dasharray: 3 2;
 }
 
 .panel-heading {
@@ -544,6 +870,7 @@ defineExpose({
 }
 
 .view-tools button,
+.draw-tools button,
 .panel-footer-overlay button {
   display: grid;
   place-items: center;
@@ -561,15 +888,86 @@ defineExpose({
 }
 
 .view-tools button:hover,
+.draw-tools button:hover,
 .panel-footer-overlay button:hover {
   color: #101418;
   background: #ffb02e;
 }
 
 .view-tools button:focus-visible,
+.draw-tools button:focus-visible,
 .panel-footer-overlay button:focus-visible {
   outline: 2px solid #fff;
   outline-offset: -3px;
+}
+
+.draw-tools {
+  top: 82px;
+  left: 18px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: min(560px, calc(100% - 106px));
+  min-height: 38px;
+  padding: 6px;
+  color: #fff;
+  background: rgba(11, 17, 20, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  backdrop-filter: blur(8px);
+}
+
+.draw-tools button {
+  display: inline-flex;
+  width: auto;
+  min-width: 34px;
+  height: 30px;
+  padding: 0 8px;
+  gap: 5px;
+  font-size: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+}
+
+.draw-tools button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.draw-tools input[type='text'] {
+  width: 96px;
+  height: 30px;
+  min-width: 0;
+  padding: 0 8px;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  font-size: 10px;
+  outline: none;
+}
+
+.draw-tools input[type='color'] {
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  background: transparent;
+  border: 1px solid rgba(255, 255, 255, 0.24);
+}
+
+.draw-tools label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  color: rgba(255, 255, 255, 0.72);
+  font-size: 9px;
+}
+
+.draw-tools input[type='range'] {
+  width: 76px;
+}
+
+.draw-tools small {
+  color: #ffcf7b;
+  font-size: 9px;
+  white-space: nowrap;
 }
 
 .view-reticle {

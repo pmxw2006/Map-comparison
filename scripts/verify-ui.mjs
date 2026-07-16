@@ -48,11 +48,15 @@ function makeVerifyPanorama() {
   header.writeUInt32BE(height, 4)
   header[8] = 8
   header[9] = 2
+  const xmp = Buffer.from(
+    '<x:xmpmeta drone-dji:GPSLatitude="31.230400" drone-dji:GPSLongitude="121.473700" drone-dji:RelativeAltitude="120.0" drone-dji:AbsoluteAltitude="132.5" drone-dji:GimbalYawDegree="18.0"></x:xmpmeta>',
+  )
   return Buffer.concat([
     Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
     pngChunk('IHDR', header),
     pngChunk('IDAT', deflateSync(raw)),
     pngChunk('IEND'),
+    xmp,
   ])
 }
 
@@ -67,6 +71,7 @@ const browser = await chromium.launch({
 })
 
 const page = await browser.newPage({ viewport: { width: 1440, height: 900 }, acceptDownloads: true })
+await page.addInitScript(() => window.localStorage.removeItem('duibi.mapRegions'))
 const browserErrors = []
 const failedResponses = []
 page.on('pageerror', (error) => browserErrors.push(`pageerror: ${error.message}`))
@@ -98,6 +103,9 @@ try {
   uploadedIds.push(...created.map((record) => record.id))
   if (created.length !== 2 || created.some((record) => record.orthophoto_status !== 'ready')) {
     throw new Error(`Persistent upload failed: ${JSON.stringify(created)}`)
+  }
+  if (created.some((record) => !record.overlay_bounds || record.projection_altitude !== 120)) {
+    throw new Error(`GPS/XMP extraction failed: ${JSON.stringify(created)}`)
   }
 
   await page.waitForFunction(() => {
@@ -147,17 +155,57 @@ try {
 
   await page.screenshot({ path: `${artifactDir}/panorama-comparison.png` })
 
+  await page.locator('.panorama-panel').first().getByRole('button', { name: '全景描绘' }).click()
+  const drawStageBox = await page.locator('.panorama-stage').first().boundingBox()
+  if (!drawStageBox) throw new Error('The panorama drawing stage has no layout box')
+  await page.mouse.click(drawStageBox.x + drawStageBox.width * 0.44, drawStageBox.y + drawStageBox.height * 0.58)
+  await page.mouse.click(drawStageBox.x + drawStageBox.width * 0.55, drawStageBox.y + drawStageBox.height * 0.58)
+  await page.mouse.click(drawStageBox.x + drawStageBox.width * 0.55, drawStageBox.y + drawStageBox.height * 0.68)
+  await page.mouse.dblclick(drawStageBox.x + drawStageBox.width * 0.44, drawStageBox.y + drawStageBox.height * 0.68)
+  await page.waitForFunction(() => document.querySelectorAll('.region-screen-layer polygon').length > 0)
+  await page.waitForFunction(() => document.querySelectorAll('.region-point-marker').length >= 3)
+  const regionBeforeTurn = await page.locator('.region-screen-layer polygon').first().getAttribute('points')
+  await page.locator('.panorama-stage').first().press('ArrowRight')
+  await page.waitForTimeout(120)
+  const regionAfterTurn = await page.locator('.region-screen-layer polygon').first().getAttribute('points')
+  if (!regionBeforeTurn || !regionAfterTurn || regionBeforeTurn === regionAfterTurn) {
+    throw new Error('Panorama region is not locked to the camera/world projection')
+  }
+
+  await page.getByRole('button', { name: /影像库/ }).click()
   const originalDownload = page.waitForEvent('download')
-  await page.locator('.panorama-panel').first().getByRole('button', { name: '下载原图' }).click()
+  await page.locator('.library-record').filter({ hasText: 'verify-panorama-a' }).first().getByRole('button', { name: '下载原图' }).click()
   const original = await originalDownload
 
   const comparisonDownload = page.waitForEvent('download')
-  await page.getByRole('button', { name: '保存对比图' }).click()
+  await page.getByRole('button', { name: '导出当前对比图' }).click()
   const comparison = await comparisonDownload
+
+  const orthophotoDownload = page.waitForEvent('download')
+  await page.locator('.library-record').filter({ hasText: 'verify-panorama-a' }).first().getByRole('button', { name: '下载正射图' }).click()
+  const orthophoto = await orthophotoDownload
+
+  await page.getByRole('button', { name: '关闭影像库' }).click()
 
   await page.getByRole('button', { name: '正射地图' }).click()
   await page.locator('.orthophoto-map').waitFor()
-  await page.locator('.unlocated-preview img').waitFor()
+  await page.locator('.leaflet-image-layer').first().waitFor()
+
+  await page.getByRole('button', { name: '开始描绘' }).click()
+  const mapBox = await page.locator('.orthophoto-map').boundingBox()
+  if (!mapBox) throw new Error('The orthophoto map has no layout box')
+  await page.mouse.click(mapBox.x + mapBox.width * 0.44, mapBox.y + mapBox.height * 0.48)
+  await page.mouse.click(mapBox.x + mapBox.width * 0.53, mapBox.y + mapBox.height * 0.46)
+  await page.mouse.click(mapBox.x + mapBox.width * 0.56, mapBox.y + mapBox.height * 0.56)
+  await page.mouse.dblclick(mapBox.x + mapBox.width * 0.45, mapBox.y + mapBox.height * 0.58)
+  await page.locator('.region-list article').first().waitFor()
+
+  await page.getByRole('button', { name: /影像库/ }).click()
+  const kmlDownload = page.waitForEvent('download')
+  await page.locator('.library-region-row').first().getByRole('button', { name: '导出 KML' }).click()
+  const kml = await kmlDownload
+  await page.getByRole('button', { name: '关闭影像库' }).click()
+
   await page.screenshot({ path: `${artifactDir}/orthophoto-map.png` })
 
   // 刷新后仍能读到刚上传的影像，证明页面不再依赖临时 blob URL。
@@ -175,7 +223,12 @@ try {
         beforeDrag,
         afterDrag,
         persistedUploads: created.map((record) => record.file_name),
-        downloads: [original.suggestedFilename(), comparison.suggestedFilename()],
+        downloads: [
+          original.suggestedFilename(),
+          comparison.suggestedFilename(),
+          orthophoto.suggestedFilename(),
+          kml.suggestedFilename(),
+        ],
         browserErrors,
         failedResponses,
         artifacts: artifactDir,

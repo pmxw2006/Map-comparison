@@ -1,11 +1,13 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ArrowLeft,
   Check,
   CheckCircle2,
   Database,
   Download,
+  Eye,
+  EyeOff,
   GalleryHorizontalEnd,
   HardDriveUpload,
   Images,
@@ -22,13 +24,16 @@ import {
 } from '@lucide/vue'
 import OrthophotoMap from './components/OrthophotoMap.vue'
 import PanoramaViewer from './components/PanoramaViewer.vue'
-import type { PanoramaItem, PanoramaViewerExpose, StoredImageDto, ViewState } from './types/panorama'
+import type { MapRegion, PanoramaItem, PanoramaViewerExpose, StoredImageDto, ViewState } from './types/panorama'
 
 const DEFAULT_VIEW: ViewState = { yaw: 0, pitch: -2, fov: 70 }
 const MAX_PANORAMAS = 4
+const REGION_STORAGE_KEY = 'duibi.mapRegions'
 
 const library = ref<PanoramaItem[]>([])
 const visibleIds = ref<string[]>([])
+const orthophotoVisibleIds = ref<string[]>([])
+const regions = ref<MapRegion[]>(loadStoredRegions())
 const views = ref<ViewState[]>([])
 const activeIndex = ref(0)
 const selectedMapId = ref<string | null>(null)
@@ -58,6 +63,30 @@ const pitchText = computed(() => {
 })
 const headingText = computed(() => String(normalizedHeading.value).padStart(3, '0'))
 const gridClass = computed(() => `count-${Math.min(panoramas.value.length, MAX_PANORAMAS)}`)
+const visibleRegionCount = computed(() => regions.value.filter((region) => region.visible).length)
+
+function loadStoredRegions(): MapRegion[] {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(REGION_STORAGE_KEY) ?? '[]')
+    if (!Array.isArray(parsed)) return []
+    return parsed
+      .filter((item) => Array.isArray(item?.points) && item.points.length >= 3)
+      .map((item, index) => ({
+        id: String(item.id ?? `region-${index + 1}`),
+        name: String(item.name ?? `区域 ${index + 1}`),
+        color: typeof item.color === 'string' ? item.color : '#ff4d4f',
+        opacity: Number.isFinite(item.opacity) ? Math.min(0.9, Math.max(0.05, Number(item.opacity))) : 0.35,
+        visible: item.visible !== false,
+        points: item.points
+          .filter((point: unknown) => Array.isArray(point) && point.length >= 2)
+          .map((point: [number, number]) => [Number(point[0]), Number(point[1])] as [number, number])
+          .filter((point: [number, number]) => Number.isFinite(point[0]) && Number.isFinite(point[1])),
+      }))
+      .filter((item) => item.points.length >= 3)
+  } catch {
+    return []
+  }
+}
 
 // 后端接口使用 snake_case；进入 Vue 状态前统一转成 camelCase，模板里就不需要关心接口字段格式。
 function fromDto(item: StoredImageDto): PanoramaItem {
@@ -80,6 +109,7 @@ function fromDto(item: StoredImageDto): PanoramaItem {
     orthophotoStatus: item.orthophoto_status,
     orthophotoKind: item.orthophoto_kind,
     orthophotoUrl: item.orthophoto_url,
+    orthophotoDownloadUrl: item.orthophoto_download_url,
     overlayBounds: item.overlay_bounds,
     nearbyIds: item.nearby_ids,
   }
@@ -101,6 +131,78 @@ async function responseJson<T>(response: Response): Promise<T> {
   throw new Error(payload?.detail ?? `请求失败（${response.status}）`)
 }
 
+function sameLocation(first: PanoramaItem, second: PanoramaItem) {
+  if (first.id === second.id) return true
+  if (first.latitude === null || first.longitude === null || second.latitude === null || second.longitude === null) {
+    return false
+  }
+  return first.nearbyIds.includes(second.id) || second.nearbyIds.includes(first.id)
+}
+
+function comparableGroup(anchorId: string | null) {
+  const anchor = library.value.find((item) => item.id === anchorId) ?? library.value[0]
+  if (!anchor) return []
+  const group = [anchor]
+  for (const item of library.value) {
+    if (item.id === anchor.id || group.length >= MAX_PANORAMAS) continue
+    if (group.every((selected) => sameLocation(selected, item))) group.push(item)
+  }
+  return group.map((item) => item.id)
+}
+
+function sanitizeVisibleIds(ids: string[]) {
+  const existing = ids.map((id) => library.value.find((item) => item.id === id)).filter(Boolean) as PanoramaItem[]
+  if (!existing.length) return []
+  const group: PanoramaItem[] = []
+  for (const item of existing) {
+    if (group.length >= MAX_PANORAMAS) break
+    if (group.length === 0 || group.every((selected) => sameLocation(selected, item))) group.push(item)
+  }
+  return group.map((item) => item.id)
+}
+
+function canJoinComparison(item: PanoramaItem) {
+  if (visibleIds.value.includes(item.id) || visibleIds.value.length === 0) return true
+  if (visibleIds.value.length >= MAX_PANORAMAS) return false
+  const selected = panoramas.value
+  return selected.every((current) => sameLocation(current, item))
+}
+
+function canReplaceActivePanorama(item: PanoramaItem) {
+  if (visibleIds.value.includes(item.id)) return true
+  if (visibleIds.value.length === 0) return true
+  const activeId = visibleIds.value[activeIndex.value] ?? visibleIds.value[0]
+  const remaining = visibleIds.value
+    .filter((id) => id !== activeId)
+    .map((id) => library.value.find((entry) => entry.id === id))
+    .filter(Boolean) as PanoramaItem[]
+  return remaining.every((current) => sameLocation(current, item))
+}
+
+function canUseLibraryItem(item: PanoramaItem) {
+  if (visibleIds.value.includes(item.id) || visibleIds.value.length < MAX_PANORAMAS) return canJoinComparison(item)
+  return canReplaceActivePanorama(item)
+}
+
+function libraryPanoramaActionLabel(item: PanoramaItem) {
+  if (visibleIds.value.includes(item.id)) return '移出当前对比'
+  if (visibleIds.value.length >= MAX_PANORAMAS) return '替换当前活动影像'
+  return '加入当前对比'
+}
+
+function isOrthophotoReady(item: PanoramaItem) {
+  return Boolean(item.orthophotoUrl && item.overlayBounds)
+}
+
+function sanitizeOrthophotoVisibleIds(ids: string[]) {
+  const ready = new Set(library.value.filter(isOrthophotoReady).map((item) => item.id))
+  const unique = [...new Set(ids)].filter((id) => ready.has(id))
+  if (unique.length) return unique
+  const fallback = library.value.find((item) => item.id === selectedMapId.value && isOrthophotoReady(item))
+    ?? library.value.find(isOrthophotoReady)
+  return fallback ? [fallback.id] : []
+}
+
 // 影像库变化后重建当前对比区的视角数组，避免删除/上传后出现视角和影像错位。
 function rebuildViews() {
   const source = views.value[activeIndex.value] ?? DEFAULT_VIEW
@@ -116,9 +218,10 @@ async function loadCatalog(initial = false) {
   try {
     const response = await fetch('/api/images')
     library.value = (await responseJson<StoredImageDto[]>(response)).map(fromDto)
-    if (initial) visibleIds.value = library.value.slice(0, MAX_PANORAMAS).map((item) => item.id)
-    else visibleIds.value = visibleIds.value.filter((id) => library.value.some((item) => item.id === id))
+    if (initial) visibleIds.value = comparableGroup(library.value[0]?.id ?? null)
+    else visibleIds.value = sanitizeVisibleIds(visibleIds.value)
     rebuildViews()
+    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds(orthophotoVisibleIds.value)
   } catch (error) {
     notify(error instanceof Error ? error.message : '无法连接影像服务')
   } finally {
@@ -166,11 +269,9 @@ async function handleUpload(event: Event) {
     )
     const uploadedIds = uploaded.map((item) => item.id)
     await loadCatalog(false)
-    visibleIds.value = [...uploadedIds, ...visibleIds.value.filter((id) => !uploadedIds.includes(id))].slice(
-      0,
-      MAX_PANORAMAS,
-    )
+    visibleIds.value = comparableGroup(uploadedIds[0] ?? null)
     selectedMapId.value = uploadedIds[0] ?? selectedMapId.value
+    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...uploadedIds, ...orthophotoVisibleIds.value])
     rebuildViews()
     notify(`已永久保存 ${uploaded.length} 幅影像${selected.length > MAX_PANORAMAS ? '，其余可在影像库中选择' : ''}`)
   } catch (error) {
@@ -181,10 +282,22 @@ async function handleUpload(event: Event) {
 }
 
 function toggleLibraryItem(id: string) {
+  const item = library.value.find((entry) => entry.id === id)
+  if (!item) return
   if (visibleIds.value.includes(id)) {
     visibleIds.value = visibleIds.value.filter((visibleId) => visibleId !== id)
   } else if (visibleIds.value.length >= MAX_PANORAMAS) {
-    notify(`对比区最多显示 ${MAX_PANORAMAS} 幅影像`)
+    if (!canReplaceActivePanorama(item)) {
+      notify('只能切换为 20 米内同一坐标位置的全景')
+      return
+    }
+    const replaceIndex = Math.min(activeIndex.value, visibleIds.value.length - 1)
+    visibleIds.value = visibleIds.value.map((visibleId, index) => (index === replaceIndex ? id : visibleId))
+    activeIndex.value = replaceIndex
+    selectedMapId.value = id
+    notify(`已替换当前活动影像`)
+  } else if (!canJoinComparison(item)) {
+    notify('只能加入 20 米内同一坐标位置的全景进行对比')
     return
   } else visibleIds.value.push(id)
   rebuildViews()
@@ -217,6 +330,248 @@ function downloadOriginal(item: PanoramaItem) {
   anchor.click()
   anchor.remove()
   notify(`正在下载 ${item.fileName}`)
+}
+
+function downloadOrthophoto(item: PanoramaItem) {
+  if (!item.orthophotoDownloadUrl) {
+    notify('该影像没有可下载的正射图')
+    return
+  }
+  const anchor = document.createElement('a')
+  anchor.href = item.orthophotoDownloadUrl
+  anchor.download = `${item.name}-orthophoto.jpg`
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  notify(`正在下载 ${item.name} 正射图`)
+}
+
+function toggleOrthophotoLayer(id: string) {
+  if (orthophotoVisibleIds.value.includes(id)) {
+    orthophotoVisibleIds.value = orthophotoVisibleIds.value.filter((visibleId) => visibleId !== id)
+  } else {
+    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...orthophotoVisibleIds.value, id])
+  }
+}
+
+function regionCenter(region: MapRegion): [number, number] | null {
+  if (!region.points.length) return null
+  const sum = region.points.reduce(
+    (total, point) => [total[0] + point[0], total[1] + point[1]] as [number, number],
+    [0, 0] as [number, number],
+  )
+  return [sum[0] / region.points.length, sum[1] / region.points.length]
+}
+
+function viewTowardPoint(image: PanoramaItem, point: [number, number], fallback: ViewState): ViewState {
+  if (image.latitude === null || image.longitude === null) return fallback
+  const latitudeScale = 111_320
+  const longitudeScale = 111_320 * Math.max(0.1, Math.cos((image.latitude * Math.PI) / 180))
+  const north = (point[0] - image.latitude) * latitudeScale
+  const east = (point[1] - image.longitude) * longitudeScale
+  const groundDistance = Math.hypot(east, north)
+  const bearing = normalizeAngle((Math.atan2(east, north) * 180) / Math.PI)
+  return {
+    yaw: normalizeAngle(bearing - image.northOffset),
+    pitch: Math.max(-82, Math.min(12, -(Math.atan2(image.projectionAltitude, Math.max(groundDistance, 0.5)) * 180) / Math.PI)),
+    fov: Math.min(78, Math.max(58, fallback.fov)),
+  }
+}
+
+function focusRegionOnPanoramas(region: MapRegion) {
+  const center = regionCenter(region)
+  if (!center || panoramas.value.length === 0) return
+  views.value = panoramas.value.map((image, index) => viewTowardPoint(image, center, views.value[index] ?? DEFAULT_VIEW))
+  notify('区域已保存，全景视角已对准该区域')
+}
+
+function updateRegions(nextRegions: MapRegion[]) {
+  const addedRegion = nextRegions.length > regions.value.length ? nextRegions[nextRegions.length - 1] : null
+  regions.value = nextRegions
+  if (addedRegion) focusRegionOnPanoramas(addedRegion)
+}
+
+function addRegion(region: MapRegion) {
+  regions.value = [...regions.value, region]
+  focusRegionOnPanoramas(region)
+}
+
+function updateRegion(id: string, patch: Partial<MapRegion>) {
+  regions.value = regions.value.map((region) => (region.id === id ? { ...region, ...patch } : region))
+}
+
+function deleteRegion(id: string) {
+  regions.value = regions.value.filter((region) => region.id !== id)
+}
+
+function escapeXml(value: string) {
+  return value
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&apos;')
+}
+
+function kmlColor(color: string, opacity: number) {
+  const value = color.replace('#', '')
+  const normalized = value.length === 3 ? value.split('').map((char) => char + char).join('') : value
+  const alpha = Math.round(Math.max(0, Math.min(1, opacity)) * 255).toString(16).padStart(2, '0')
+  const red = normalized.slice(0, 2)
+  const green = normalized.slice(2, 4)
+  const blue = normalized.slice(4, 6)
+  return `${alpha}${blue}${green}${red}`
+}
+
+function regionToKml(region: MapRegion) {
+  const closedPoints = [...region.points, region.points[0]]
+  const coordinates = closedPoints.map(([lat, lng]) => `${lng},${lat},0`).join(' ')
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>${escapeXml(region.name)}</name>
+    <Style id="region-style">
+      <LineStyle><color>ff${kmlColor(region.color, 1).slice(2)}</color><width>2</width></LineStyle>
+      <PolyStyle><color>${kmlColor(region.color, region.opacity)}</color></PolyStyle>
+    </Style>
+    <Placemark>
+      <name>${escapeXml(region.name)}</name>
+      <styleUrl>#region-style</styleUrl>
+      <Polygon>
+        <outerBoundaryIs>
+          <LinearRing>
+            <coordinates>${coordinates}</coordinates>
+          </LinearRing>
+        </outerBoundaryIs>
+      </Polygon>
+    </Placemark>
+  </Document>
+</kml>`
+}
+
+function downloadText(filename: string, content: string, mimeType: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: mimeType }))
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportRegion(region: MapRegion) {
+  downloadText(`${region.name}.kml`, regionToKml(region), 'application/vnd.google-earth.kml+xml')
+}
+
+function exportVisibleRegions() {
+  const visibleRegions = regions.value.filter((region) => region.visible && region.points.length >= 3)
+  if (!visibleRegions.length) {
+    notify('当前没有可导出的可见区域')
+    return
+  }
+  const placemarks = visibleRegions
+    .map((region) => {
+      const closedPoints = [...region.points, region.points[0]]
+      const coordinates = closedPoints.map(([lat, lng]) => `${lng},${lat},0`).join(' ')
+      return `
+    <Placemark>
+      <name>${escapeXml(region.name)}</name>
+      <Style>
+        <LineStyle><color>ff${kmlColor(region.color, 1).slice(2)}</color><width>2</width></LineStyle>
+        <PolyStyle><color>${kmlColor(region.color, region.opacity)}</color></PolyStyle>
+      </Style>
+      <Polygon><outerBoundaryIs><LinearRing><coordinates>${coordinates}</coordinates></LinearRing></outerBoundaryIs></Polygon>
+    </Placemark>`
+    })
+    .join('')
+  downloadText(
+    '区域图层.kml',
+    `<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>${placemarks}</Document></kml>`,
+    'application/vnd.google-earth.kml+xml',
+  )
+}
+
+function normalizeAngle(value: number) {
+  return ((value % 360) + 360) % 360
+}
+
+function signedAngle(value: number) {
+  return ((value + 540) % 360) - 180
+}
+
+function hexToRgba(color: string, opacity: number) {
+  const value = color.replace('#', '')
+  const normalized = value.length === 3 ? value.split('').map((char) => char + char).join('') : value
+  const numeric = Number.parseInt(normalized, 16)
+  if (!Number.isFinite(numeric)) return `rgba(255, 77, 79, ${opacity})`
+  return `rgba(${(numeric >> 16) & 255}, ${(numeric >> 8) & 255}, ${numeric & 255}, ${opacity})`
+}
+
+function projectRegionPoint(
+  image: PanoramaItem,
+  view: ViewState,
+  point: [number, number],
+  width: number,
+  height: number,
+) {
+  if (image.latitude === null || image.longitude === null) return null
+  const latitudeScale = 111_320
+  const longitudeScale = 111_320 * Math.max(0.1, Math.cos((image.latitude * Math.PI) / 180))
+  const north = (point[0] - image.latitude) * latitudeScale
+  const east = (point[1] - image.longitude) * longitudeScale
+  const groundDistance = Math.hypot(east, north)
+  const bearing = normalizeAngle((Math.atan2(east, north) * 180) / Math.PI)
+  const targetYaw = normalizeAngle(bearing - image.northOffset)
+  const targetPitch = -(Math.atan2(image.projectionAltitude, groundDistance) * 180) / Math.PI
+  const deltaYaw = signedAngle(targetYaw - view.yaw)
+  if (Math.abs(deltaYaw) > 88) return null
+
+  const verticalFov = (view.fov * Math.PI) / 180
+  const horizontalFov = 2 * Math.atan(Math.tan(verticalFov / 2) * (width / height))
+  const x = width / 2 + (Math.tan((deltaYaw * Math.PI) / 180) / Math.tan(horizontalFov / 2)) * (width / 2)
+  const y =
+    height / 2 -
+    (Math.tan(((targetPitch - view.pitch) * Math.PI) / 180) / Math.tan(verticalFov / 2)) * (height / 2)
+  return { x, y }
+}
+
+function drawRegionsOnExport(
+  context: CanvasRenderingContext2D,
+  image: PanoramaItem,
+  view: ViewState,
+  x: number,
+  y: number,
+  width: number,
+  height: number,
+) {
+  for (const region of regions.value.filter((item) => item.visible && item.points.length >= 3)) {
+    const points = region.points
+      .map((point) => projectRegionPoint(image, view, point, width, height))
+      .filter(Boolean) as Array<{ x: number; y: number }>
+    if (points.length < 3) continue
+    context.save()
+    context.translate(x, y)
+    context.beginPath()
+    points.forEach((point, index) => {
+      if (index === 0) context.moveTo(point.x, point.y)
+      else context.lineTo(point.x, point.y)
+    })
+    context.closePath()
+    context.fillStyle = hexToRgba(region.color, region.opacity)
+    context.strokeStyle = region.color
+    context.lineWidth = 4
+    context.fill()
+    context.stroke()
+    points.forEach((point) => {
+      context.beginPath()
+      context.arc(point.x, point.y, 9, 0, Math.PI * 2)
+      context.fillStyle = region.color
+      context.strokeStyle = '#fff'
+      context.lineWidth = 3
+      context.fill()
+      context.stroke()
+    })
+    context.restore()
+  }
 }
 
 function drawCover(
@@ -279,6 +634,9 @@ async function exportComparison() {
     const x = (index % columns) * cellWidth
     const y = Math.floor(index / columns) * cellHeight
     drawCover(context, source, x, y, cellWidth, cellHeight)
+    const image = panoramas.value[index]
+    const view = views.value[index] ?? activeView.value
+    if (image) drawRegionsOnExport(context, image, view, x, y, cellWidth, cellHeight)
     context.fillStyle = 'rgba(7, 12, 15, 0.74)'
     context.fillRect(x, y + cellHeight - 58, cellWidth, 58)
     context.fillStyle = '#fff'
@@ -309,6 +667,10 @@ function goBack() {
 
 function selectMapImage(id: string) {
   selectedMapId.value = id
+  const item = library.value.find((entry) => entry.id === id)
+  if (item && isOrthophotoReady(item) && !orthophotoVisibleIds.value.includes(id)) {
+    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...orthophotoVisibleIds.value, id])
+  }
   const index = panoramas.value.findIndex((item) => item.id === id)
   if (index >= 0) activeIndex.value = index
 }
@@ -326,6 +688,12 @@ onBeforeUnmount(() => {
   window.clearTimeout(toastTimer)
   document.removeEventListener('fullscreenchange', handleFullscreenChange)
 })
+
+watch(
+  regions,
+  (value) => window.localStorage.setItem(REGION_STORAGE_KEY, JSON.stringify(value)),
+  { deep: true },
+)
 </script>
 
 <template>
@@ -391,7 +759,13 @@ onBeforeUnmount(() => {
       <div class="context-divider" />
       <div><HardDriveUpload :size="14" /> 文件永久保存</div>
       <div class="context-spacer" />
-      <div>{{ workspaceMode === 'orthophoto' ? '20 米内自动归为同位置候选' : `最多 ${MAX_PANORAMAS} 幅同步对比` }}</div>
+      <div>
+        {{
+          workspaceMode === 'orthophoto'
+            ? `正射图层 ${orthophotoVisibleIds.length} 个 · 区域 ${visibleRegionCount} 个`
+            : `仅支持 20 米内同位置对比，最多 ${MAX_PANORAMAS} 幅`
+        }}
+      </div>
     </div>
 
     <main class="workspace">
@@ -424,9 +798,11 @@ onBeforeUnmount(() => {
             :index="index"
             :active="activeIndex === index"
             :removable="true"
+            :regions="regions"
             @activate="activeIndex = index; selectedMapId = panorama.id"
             @view-change="(view) => handleViewChange(index, view)"
-            @download="downloadOriginal(panorama)"
+            @region-create="addRegion"
+            @notice="notify"
             @remove="removePanorama(index)"
           />
         </section>
@@ -436,7 +812,11 @@ onBeforeUnmount(() => {
         v-else
         :images="library"
         :selected-id="selectedMapId ?? library[0]?.id ?? null"
+        :visible-orthophoto-ids="orthophotoVisibleIds"
+        :regions="regions"
         @select="selectMapImage"
+        @toggle-orthophoto="toggleOrthophotoLayer"
+        @regions-change="updateRegions"
       />
 
       <Transition name="drawer">
@@ -444,39 +824,133 @@ onBeforeUnmount(() => {
           <div class="library-heading">
             <div>
               <strong>永久影像库</strong>
-              <span>{{ library.length }} 幅已保存影像</span>
+              <span>{{ library.length }} 幅已保存影像 · 下载与缩略图集中在这里</span>
             </div>
-            <button type="button" title="关闭影像库" aria-label="关闭影像库" @click="libraryOpen = false">
-              <X :size="18" />
-            </button>
+            <div class="library-heading-actions">
+              <button
+                type="button"
+                title="导出当前对比图"
+                aria-label="导出当前对比图"
+                :disabled="panoramas.length === 0"
+                @click="exportComparison"
+              >
+                <Download :size="16" />
+              </button>
+              <button type="button" title="关闭影像库" aria-label="关闭影像库" @click="libraryOpen = false">
+                <X :size="18" />
+              </button>
+            </div>
           </div>
           <div class="library-list">
-            <article v-for="item in library" :key="item.id" :class="{ selected: visibleIds.includes(item.id) }">
-              <img :src="item.orthophotoUrl ?? item.src" :alt="item.name" />
-              <div class="library-item-info">
-                <strong>{{ item.name }}</strong>
-                <span>{{ item.detail }}</span>
-                <small>{{ item.latitude === null ? '无 GPS' : 'GPS 已提取' }} · {{ item.orthophotoStatus === 'ready' ? '地面反投影就绪' : '无反投影预览' }}</small>
-              </div>
-              <div class="library-item-actions">
-                <button
-                  type="button"
-                  :class="{ active: visibleIds.includes(item.id) }"
-                  :title="visibleIds.includes(item.id) ? '移出当前对比' : '加入当前对比'"
-                  :aria-label="visibleIds.includes(item.id) ? '移出当前对比' : '加入当前对比'"
-                  @click="toggleLibraryItem(item.id)"
-                >
-                  <Check v-if="visibleIds.includes(item.id)" :size="16" />
-                  <Images v-else :size="16" />
-                </button>
-                <button type="button" title="下载原图" aria-label="下载原图" @click="downloadOriginal(item)">
-                  <Download :size="16" />
-                </button>
+            <article v-for="item in library" :key="item.id" class="library-record" :class="{ selected: visibleIds.includes(item.id) }">
+              <header class="library-record-heading">
+                <div>
+                  <strong>{{ item.name }}</strong>
+                  <span>{{ item.latitude === null ? '无 GPS' : 'GPS 已提取' }} · {{ item.orthophotoStatus === 'ready' ? '地面反投影就绪' : '无反投影预览' }}</span>
+                </div>
                 <button type="button" class="danger" title="永久删除" aria-label="永久删除" @click="permanentlyDelete(item)">
                   <Trash2 :size="16" />
                 </button>
-              </div>
+              </header>
+
+              <section class="library-type-group">
+                <div class="library-type-label">全景原图</div>
+                <div class="library-child-card">
+                  <img :src="item.src" :alt="`${item.name}全景原图`" />
+                  <div class="library-item-info">
+                    <strong>360 全景</strong>
+                    <span>{{ item.detail }}</span>
+                    <small>{{ item.fileName }}</small>
+                  </div>
+                  <div class="library-item-actions">
+                    <button
+                      type="button"
+                      :class="{ active: visibleIds.includes(item.id) }"
+                      :disabled="!canUseLibraryItem(item)"
+                      :title="libraryPanoramaActionLabel(item)"
+                      :aria-label="libraryPanoramaActionLabel(item)"
+                      @click="toggleLibraryItem(item.id)"
+                    >
+                      <Check v-if="visibleIds.includes(item.id)" :size="16" />
+                      <Images v-else :size="16" />
+                    </button>
+                    <button type="button" title="下载原图" aria-label="下载原图" @click="downloadOriginal(item)">
+                      <Download :size="16" />
+                    </button>
+                  </div>
+                </div>
+              </section>
+
+              <section class="library-type-group">
+                <div class="library-type-label">转换正射图</div>
+                <div v-if="item.orthophotoUrl" class="library-child-card">
+                  <img :src="item.orthophotoUrl" :alt="`${item.name}转换正射图`" />
+                  <div class="library-item-info">
+                    <strong>500 m × 500 m</strong>
+                    <span>平坦地面反投影预览</span>
+                    <small>{{ orthophotoVisibleIds.includes(item.id) ? '已显示在天地图' : '未显示' }}</small>
+                  </div>
+                  <div class="library-item-actions">
+                    <button
+                      type="button"
+                      :class="{ active: orthophotoVisibleIds.includes(item.id) }"
+                      :title="orthophotoVisibleIds.includes(item.id) ? '隐藏正射图层' : '显示正射图层'"
+                      :aria-label="orthophotoVisibleIds.includes(item.id) ? '隐藏正射图层' : '显示正射图层'"
+                      @click="toggleOrthophotoLayer(item.id)"
+                    >
+                      <Check v-if="orthophotoVisibleIds.includes(item.id)" :size="16" />
+                      <Map v-else :size="16" />
+                    </button>
+                    <button
+                      type="button"
+                      :disabled="!item.orthophotoDownloadUrl"
+                      title="下载正射图"
+                      aria-label="下载正射图"
+                      @click="downloadOrthophoto(item)"
+                    >
+                      <Download :size="16" />
+                    </button>
+                  </div>
+                </div>
+                <div v-else class="library-child-card is-empty">
+                  <div class="library-empty-preview"><Map :size="18" /></div>
+                  <div class="library-item-info">
+                    <strong>未生成</strong>
+                    <span>非 2:1 全景或缺少可处理内容</span>
+                    <small>无可下载正射图</small>
+                  </div>
+                </div>
+              </section>
             </article>
+
+            <section class="library-region-downloads">
+              <div class="library-type-label">区域图层 KML</div>
+              <div class="library-region-toolbar">
+                <span>{{ regions.length ? `${regions.length} 个区域` : '暂无区域' }}</span>
+                <button type="button" :disabled="visibleRegionCount === 0" @click="exportVisibleRegions">
+                  <Download :size="15" /> 导出可见区域
+                </button>
+              </div>
+              <article v-for="region in regions" :key="region.id" class="library-region-row">
+                <button
+                  type="button"
+                  :title="region.visible ? '隐藏区域' : '显示区域'"
+                  :aria-label="region.visible ? '隐藏区域' : '显示区域'"
+                  @click="updateRegion(region.id, { visible: !region.visible })"
+                >
+                  <Eye v-if="region.visible" :size="14" />
+                  <EyeOff v-else :size="14" />
+                </button>
+                <i :style="{ background: region.color, opacity: region.opacity }" />
+                <span>{{ region.name }}</span>
+                <button type="button" title="导出 KML" aria-label="导出 KML" @click="exportRegion(region)">
+                  <Download :size="14" />
+                </button>
+                <button type="button" class="danger" title="删除区域" aria-label="删除区域" @click="deleteRegion(region.id)">
+                  <Trash2 :size="14" />
+                </button>
+              </article>
+            </section>
           </div>
         </aside>
       </Transition>
@@ -509,10 +983,6 @@ onBeforeUnmount(() => {
           <Minimize2 v-if="isFullscreen" :size="17" />
           <Maximize2 v-else :size="17" />
           <span>{{ isFullscreen ? '退出全屏' : '全屏' }}</span>
-        </button>
-        <button type="button" class="export-button" :disabled="panoramas.length === 0" @click="exportComparison">
-          <Download :size="17" />
-          <span>保存对比图</span>
         </button>
       </div>
     </footer>

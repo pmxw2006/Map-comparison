@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -9,6 +10,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile
@@ -27,6 +30,8 @@ MAX_FILE_SIZE = 500 * 1024 * 1024
 NEARBY_DISTANCE_METERS = 20.0
 ORTHOPHOTO_FOOTPRINT_METERS = 500.0
 DEFAULT_PROJECTION_ALTITUDE_METERS = 120.0
+GEOCODE_TIMEOUT_SECONDS = 4
+PANORAMA_NORTH_CORRECTION_DEGREES = 180.0
 
 for directory in (DATA_DIR, IMAGE_DIR, ORTHOPHOTO_DIR):
     directory.mkdir(parents=True, exist_ok=True)
@@ -44,6 +49,22 @@ app.add_middleware(
 )
 app.mount("/media/images", StaticFiles(directory=IMAGE_DIR), name="images")
 app.mount("/media/orthophotos", StaticFiles(directory=ORTHOPHOTO_DIR), name="orthophotos")
+
+
+def tianditu_token() -> str:
+    """读取天地图 Key；开发环境通常只放在 Vite 的 .env.local 中。"""
+    token = os.environ.get("TIANDITU_TOKEN") or os.environ.get("VITE_TIANDITU_TOKEN")
+    if token:
+        return token.strip()
+
+    for env_file in (ROOT_DIR / ".env.local", ROOT_DIR / ".env", ROOT_DIR / ".env.example"):
+        if not env_file.exists():
+            continue
+        for line in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.startswith(("TIANDITU_TOKEN=", "VITE_TIANDITU_TOKEN=")):
+                continue
+            return line.split("=", 1)[1].strip().strip("\"'")
+    return ""
 
 
 def database() -> sqlite3.Connection:
@@ -201,6 +222,15 @@ def projection_altitude_meters(relative_altitude: float | int | None) -> float:
     return altitude
 
 
+def corrected_panorama_heading(heading: float | int | None) -> float:
+    """大疆 360 全景的等距柱状图中心与 XMP 航向相差 180°，这里统一修正南北方向。"""
+    try:
+        value = float(heading or 0)
+    except (TypeError, ValueError):
+        value = 0
+    return (value + PANORAMA_NORTH_CORRECTION_DEGREES) % 360
+
+
 def build_nadir_preview(
     source_path: Path,
     target_path: Path,
@@ -219,7 +249,7 @@ def build_nadir_preview(
         half_footprint = ORTHOPHOTO_FOOTPRINT_METERS / 2
         meters_per_pixel = ORTHOPHOTO_FOOTPRINT_METERS / output_size
         output = np.empty((output_size, output_size, 3), dtype=np.uint8)
-        yaw_offset = math.radians(heading or 0)
+        yaw_offset = math.radians(corrected_panorama_heading(heading))
         east_offsets = (np.arange(output_size) + 0.5) * meters_per_pixel - half_footprint
 
         for row_start in range(0, output_size, 128):
@@ -298,13 +328,17 @@ def serialize_rows(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
                 "relative_altitude": row["relative_altitude"],
                 "projection_altitude": projection_altitude_meters(row["relative_altitude"]),
                 "heading": row["heading"],
-                "north_offset": row["north_offset"],
+                # 对外给前端使用修正后的北向偏移，保证指南针、全景描绘和正射反投影方向一致。
+                "north_offset": corrected_panorama_heading(row["north_offset"]),
                 "image_url": f"/media/images/{row['stored_name']}",
                 "download_url": f"/api/images/{row['id']}/download",
                 "orthophoto_status": row["orthophoto_status"],
                 "orthophoto_kind": row["orthophoto_kind"],
                 "orthophoto_url": (
                     f"/media/orthophotos/{row['orthophoto_name']}" if row["orthophoto_name"] else None
+                ),
+                "orthophoto_download_url": (
+                    f"/api/images/{row['id']}/orthophoto/download" if row["orthophoto_name"] else None
                 ),
                 "overlay_bounds": bounds,
                 "nearby_ids": nearby_ids,
@@ -319,9 +353,76 @@ def list_records() -> list[dict[str, Any]]:
     return serialize_rows(rows)
 
 
+def pick_place_name(payload: dict[str, Any]) -> str:
+    """从天地图逆地理编码结果中取最适合作为“靠近某地”的短名称。"""
+    result = payload.get("result") if isinstance(payload, dict) else None
+    if not isinstance(result, dict):
+        return ""
+
+    component = result.get("addressComponent")
+    if isinstance(component, dict):
+        for key in ("village", "town", "county", "poi", "address", "city", "province"):
+            value = component.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+    for key in ("formatted_address", "formattedAddress", "address"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def request_tianditu_reverse_geocode(latitude: float, longitude: float) -> dict[str, str]:
+    token = tianditu_token()
+    fallback = f"{latitude:.6f}, {longitude:.6f}"
+    if not token:
+        return {"name": fallback, "formatted_address": fallback, "source": "fallback"}
+
+    # 天地图逆地理编码要求把经纬度 JSON 放入 postStr 参数；通过后端代理可避免浏览器跨域问题。
+    query = urlencode(
+        {
+            "postStr": json.dumps({"lon": longitude, "lat": latitude, "ver": 1}, separators=(",", ":")),
+            "type": "geocode",
+            "tk": token,
+        }
+    )
+    url = f"https://api.tianditu.gov.cn/geocoder?{query}"
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Referer": os.environ.get("TIANDITU_REFERER", "http://localhost:5173/"),
+        },
+    )
+    try:
+        with urlopen(request, timeout=GEOCODE_TIMEOUT_SECONDS) as response:
+            payload = json.loads(response.read().decode("utf-8", errors="ignore"))
+    except Exception:
+        return {"name": fallback, "formatted_address": fallback, "source": "fallback"}
+
+    name = pick_place_name(payload) or fallback
+    result = payload.get("result") if isinstance(payload, dict) else {}
+    formatted = result.get("formatted_address") if isinstance(result, dict) else ""
+    return {
+        "name": name,
+        "formatted_address": formatted or name,
+        "source": "tianditu" if name != fallback else "fallback",
+    }
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/geocode/reverse")
+async def reverse_geocode(lat: float, lng: float) -> dict[str, str]:
+    if not math.isfinite(lat) or not math.isfinite(lng):
+        raise HTTPException(status_code=400, detail="经纬度无效")
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        raise HTTPException(status_code=400, detail="经纬度超出范围")
+    return await asyncio.to_thread(request_tianditu_reverse_geocode, lat, lng)
 
 
 @app.get("/api/images")
@@ -434,6 +535,23 @@ def download_image(image_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="影像不存在")
     return FileResponse(IMAGE_DIR / row["stored_name"], filename=row["original_name"], media_type=row["mime_type"])
+
+
+@app.get("/api/images/{image_id}/orthophoto/download")
+def download_orthophoto(image_id: str):
+    from fastapi.responses import FileResponse
+
+    with database() as connection:
+        row = connection.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
+    if not row or not row["orthophoto_name"]:
+        raise HTTPException(status_code=404, detail="正射图不存在")
+
+    source_name = Path(row["original_name"]).stem
+    return FileResponse(
+        ORTHOPHOTO_DIR / row["orthophoto_name"],
+        filename=f"{source_name}-orthophoto.jpg",
+        media_type="image/jpeg",
+    )
 
 
 @app.delete("/api/images/{image_id}")
