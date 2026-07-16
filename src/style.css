@@ -309,6 +309,18 @@ button {
   cursor: pointer;
 }
 
+.error-state > div {
+  color: #fecaca;
+  background: #3c2528;
+  border-color: #7f3b42;
+}
+
+.error-state button {
+  color: #fff;
+  background: #b42318;
+  border-color: #d04437;
+}
+
 .panorama-grid {
   display: grid;
   width: 100%;
@@ -477,26 +489,11 @@ button {
   border: 1px solid #dfe6e9;
 }
 
-.library-child-card.is-empty {
-  grid-template-columns: 92px minmax(0, 1fr);
-  color: #87949c;
-  background: #f3f5f6;
-}
-
-.library-child-card img,
-.library-empty-preview {
+.library-child-card img {
   width: 92px;
   height: 58px;
   object-fit: cover;
   background: #182027;
-}
-
-.library-empty-preview {
-  display: grid;
-  place-items: center;
-  color: #a1adb4;
-  background: #e8edf0;
-  border: 1px dashed #c7d1d6;
 }
 
 .library-item-info {
@@ -690,18 +687,6 @@ button {
   border-color: #246a51;
 }
 
-.app-footer .export-button {
-  color: #171c1f;
-  background: #ffb02e;
-  border-color: #ffb02e;
-}
-
-.app-footer .export-button:hover {
-  color: #111;
-  background: #f5a51c;
-  border-color: #f5a51c;
-}
-
 .toast-message {
   position: fixed;
   z-index: 100;
@@ -721,6 +706,12 @@ button {
   font-size: 12px;
   transform: translateX(-50%);
   backdrop-filter: blur(8px);
+}
+
+.toast-message.error {
+  color: #fff1f0;
+  background: rgba(127, 29, 29, 0.96);
+  border-color: rgba(254, 202, 202, 0.48);
 }
 
 .visually-hidden {

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-import { LoaderCircle, Navigation, PenTool, RotateCcw, Trash2, Undo2, X, ZoomIn, ZoomOut } from '@lucide/vue'
+import { Check, LoaderCircle, Navigation, PenTool, RotateCcw, Trash2, Undo2, X, ZoomIn, ZoomOut } from '@lucide/vue'
 import {
   MathUtils,
   Mesh,
@@ -14,14 +14,14 @@ import {
   Vector3,
   WebGLRenderer,
 } from 'three'
-import type { MapRegion, PanoramaItem, ViewState } from '../types/panorama'
+import { formatHeading, groundPointToView, normalizeDegrees, viewToGroundPoint } from '../geometry'
+import type { ImageRecord, LatLng, MapRegion, ViewState } from '../types/panorama'
 
 const props = defineProps<{
-  image: PanoramaItem
+  image: ImageRecord
   view: ViewState
   index: number
   active: boolean
-  removable: boolean
   regions: MapRegion[]
 }>()
 
@@ -38,7 +38,7 @@ const loading = ref(true)
 const loadError = ref(false)
 const dragging = ref(false)
 const drawing = ref(false)
-const draftPoints = ref<Array<[number, number]>>([])
+const draftPoints = ref<LatLng[]>([])
 const regionColor = ref('#ff4d4f')
 const regionOpacity = ref(0.35)
 const regionName = ref('')
@@ -60,70 +60,59 @@ let dragStartYaw = 0
 let dragStartPitch = 0
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
-const normalizeAngle = (value: number) => ((value % 360) + 360) % 360
-
-const heading = computed(() => Math.round(normalizeAngle(localView.yaw + props.image.northOffset)))
+const heading = computed(() => normalizeDegrees(Math.round(localView.yaw + props.image.northOffset)))
 const pitchText = computed(() => {
   const pitch = Math.round(localView.pitch)
   return `${pitch > 0 ? '+' : ''}${pitch}`
 })
-const headingText = computed(() => String(heading.value).padStart(3, '0'))
-const canDrawOnPanorama = computed(() => props.image.latitude !== null && props.image.longitude !== null)
+const headingText = computed(() => formatHeading(localView.yaw + props.image.northOffset))
+const imageDetail = computed(() => {
+  const megabytes = props.image.fileSize / (1024 * 1024)
+  return `${props.image.width} × ${props.image.height} · ${megabytes.toFixed(megabytes < 10 ? 1 : 0)} MB`
+})
 const cardinal = computed(() => {
   const points = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
   return points[Math.round(heading.value / 45) % points.length]
 })
 
-const visibleRegionPolygons = computed(() => {
-  if (!stageSize.width || !stageSize.height) return []
-  return props.regions
-    .filter((region) => region.visible && region.points.length >= 3)
-    .map((region) => {
-      const points = region.points
-        .map((point) => projectRegionPoint(point))
-        .filter(Boolean) as Array<{ x: number; y: number }>
-      return { region, count: points.length, points: points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ') }
-    })
-    .filter((item) => item.count >= 3)
-})
+type ScreenPoint = { x: number; y: number }
 
-const visibleRegionMarkers = computed(() => {
-  if (!stageSize.width || !stageSize.height) return []
-  return props.regions
+const screenOverlays = computed(() => {
+  const empty = {
+    regions: [] as Array<{ region: MapRegion; points: string }>,
+    markers: [] as Array<ScreenPoint & { id: string; region: MapRegion }>,
+    draft: [] as ScreenPoint[],
+  }
+  const cameraForward = prepareProjection()
+  if (!cameraForward) return empty
+
+  // 每个地理点只投影一次，生成的坐标同时供多边形和顶点标记使用。
+  const regions = props.regions
     .filter((region) => region.visible)
-    .flatMap((region) =>
-      region.points
-        .map((point, pointIndex) => {
-          const projected = projectRegionPoint(point)
-          if (!projected) return null
-          return {
-            id: `${region.id}-${pointIndex}`,
-            region,
-            x: projected.x,
-            y: projected.y,
-          }
-        })
-        .filter(Boolean),
-    ) as Array<{ id: string; region: MapRegion; x: number; y: number }>
-})
-
-const draftScreenPoints = computed(() => {
-  if (!stageSize.width || !stageSize.height) return ''
-  const points = draftPoints.value
-    .map((point) => projectRegionPoint(point))
-    .filter(Boolean) as Array<{ x: number; y: number }>
-  return points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')
-})
-
-const draftScreenMarkers = computed(() => {
-  if (!stageSize.width || !stageSize.height) return []
-  return draftPoints.value
-    .map((point, pointIndex) => {
-      const projected = projectRegionPoint(point)
-      return projected ? { id: `draft-${pointIndex}`, x: projected.x, y: projected.y } : null
+    .map((region) => {
+      const markers = region.points
+        .map((point) => projectRegionPoint(point, cameraForward))
+        .filter((point): point is ScreenPoint => point !== null)
+      return {
+        region,
+        points: markers.length >= 3 ? serializePoints(markers) : '',
+        markers: markers.map((point, index) => ({ ...point, id: `${region.id}-${index}`, region })),
+      }
     })
-    .filter(Boolean) as Array<{ id: string; x: number; y: number }>
+
+  const draft = draftPoints.value
+    .map((point) => projectRegionPoint(point, cameraForward))
+    .filter((point): point is ScreenPoint => point !== null)
+  return {
+    regions: regions.map(({ region, points }) => ({ region, points })),
+    markers: regions.flatMap((region) => region.markers),
+    draft,
+  }
 })
+
+function serializePoints(points: ScreenPoint[]) {
+  return points.map((point) => `${point.x.toFixed(1)},${point.y.toFixed(1)}`).join(' ')
+}
 
 function yawPitchToWorld(yaw: number, pitch: number, distance = 500) {
   const phi = MathUtils.degToRad(90 - pitch)
@@ -135,32 +124,23 @@ function yawPitchToWorld(yaw: number, pitch: number, distance = 500) {
   )
 }
 
-function groundPointToWorld(point: [number, number]) {
-  if (props.image.latitude === null || props.image.longitude === null) return null
-  const latitudeScale = 111_320
-  const longitudeScale = 111_320 * Math.max(0.1, Math.cos(MathUtils.degToRad(props.image.latitude)))
-  const north = (point[0] - props.image.latitude) * latitudeScale
-  const east = (point[1] - props.image.longitude) * longitudeScale
-  const groundDistance = Math.hypot(east, north)
-  const bearing = normalizeAngle(MathUtils.radToDeg(Math.atan2(east, north)))
-  const targetYaw = normalizeAngle(bearing - props.image.northOffset)
-  const targetPitch = -MathUtils.radToDeg(Math.atan2(props.image.projectionAltitude, groundDistance))
-  return yawPitchToWorld(targetYaw, targetPitch)
-}
-
-function projectRegionPoint(point: [number, number]) {
-  if (!camera) return null
-  const worldPoint = groundPointToWorld(point)
-  if (!worldPoint) return null
-
-  // 区域贴附使用和 WebGL 全景相同的相机矩阵；旋转视角时，点会锁定在同一个真实方位上。
+function prepareProjection() {
+  // 先读取响应式尺寸，确保相机尚未挂载时 computed 仍会在首次 resize 后重新计算。
+  if (!stageSize.width || !stageSize.height || !camera) return null
   updateCamera()
   camera.updateMatrixWorld(true)
   const cameraForward = new Vector3()
   camera.getWorldDirection(cameraForward)
+  return cameraForward
+}
+
+function projectRegionPoint(point: LatLng, cameraForward: Vector3): ScreenPoint | null {
+  if (!camera) return null
+  const target = groundPointToView(props.image, point)
+  const worldPoint = yawPitchToWorld(target.yaw, target.pitch)
   if (worldPoint.clone().normalize().dot(cameraForward) <= 0.02) return null
 
-  const projected = worldPoint.clone().project(camera)
+  const projected = worldPoint.project(camera)
   if (!Number.isFinite(projected.x) || !Number.isFinite(projected.y)) return null
   if (Math.abs(projected.x) > 8 || Math.abs(projected.y) > 8) return null
 
@@ -170,8 +150,8 @@ function projectRegionPoint(point: [number, number]) {
   }
 }
 
-function screenToGroundPoint(clientX: number, clientY: number): [number, number] | null {
-  if (!stage.value || !camera || props.image.latitude === null || props.image.longitude === null) return null
+function screenToGroundPoint(clientX: number, clientY: number): LatLng | null {
+  if (!stage.value || !camera) return null
   const bounds = stage.value.getBoundingClientRect()
   if (bounds.width < 1 || bounds.height < 1) return null
 
@@ -180,31 +160,15 @@ function screenToGroundPoint(clientX: number, clientY: number): [number, number]
   updateCamera()
   camera.updateMatrixWorld(true)
 
-  // 鼠标屏幕点先反投影为当前相机射线，再和“相机下方的平坦地面”求交。
+  // 屏幕点先反投影为相机射线，再由共享几何函数与相机下方的水平地面求交。
   const rayPoint = new Vector3((x / bounds.width) * 2 - 1, -(y / bounds.height) * 2 + 1, 0.5).unproject(camera)
   const direction = rayPoint.sub(camera.position).normalize()
   const targetPitch = MathUtils.radToDeg(Math.asin(direction.y))
-
-  // 单张全景只能把屏幕点反算到“平坦地面”上；视线接近天空/地平线时没有稳定的落地点。
-  if (targetPitch >= -0.5) return null
-
-  const groundDistance = props.image.projectionAltitude / Math.tan(MathUtils.degToRad(-targetPitch))
-  if (!Number.isFinite(groundDistance) || groundDistance <= 0) return null
-
-  const targetYaw = normalizeAngle(MathUtils.radToDeg(Math.atan2(direction.z, direction.x)))
-  const bearing = normalizeAngle(targetYaw + props.image.northOffset)
-  const east = groundDistance * Math.sin(MathUtils.degToRad(bearing))
-  const north = groundDistance * Math.cos(MathUtils.degToRad(bearing))
-  const latitudeScale = 111_320
-  const longitudeScale = 111_320 * Math.max(0.1, Math.cos(MathUtils.degToRad(props.image.latitude)))
-  return [props.image.latitude + north / latitudeScale, props.image.longitude + east / longitudeScale]
+  const targetYaw = MathUtils.radToDeg(Math.atan2(direction.z, direction.x))
+  return viewToGroundPoint(props.image, targetYaw, targetPitch)
 }
 
 function startDrawing() {
-  if (!canDrawOnPanorama.value) {
-    emit('notice', '当前全景没有 GPS，无法描绘地理区域')
-    return
-  }
   drawing.value = true
   dragging.value = false
   pointerId = null
@@ -261,6 +225,7 @@ function updateCamera() {
 
 function renderNow() {
   updateCamera()
+  // 导出方必须在本函数返回后立即复制画布；无需长期保留绘制缓冲，可减少显存占用。
   if (renderer && scene && camera) renderer.render(scene, camera)
 }
 
@@ -274,7 +239,7 @@ function scheduleRender() {
 }
 
 function publishView(next: Partial<ViewState>) {
-  if (next.yaw !== undefined) localView.yaw = normalizeAngle(next.yaw)
+  if (next.yaw !== undefined) localView.yaw = normalizeDegrees(next.yaw)
   if (next.pitch !== undefined) localView.pitch = clamp(next.pitch, -85, 85)
   if (next.fov !== undefined) localView.fov = clamp(next.fov, 32, 96)
 
@@ -421,13 +386,6 @@ function onKeydown(event: KeyboardEvent) {
   action()
 }
 
-function onDoubleClick(event: MouseEvent) {
-  if (!drawing.value) return
-  event.preventDefault()
-  event.stopPropagation()
-  finishDrawing()
-}
-
 onMounted(async () => {
   await nextTick()
   if (!stage.value) return
@@ -439,8 +397,6 @@ onMounted(async () => {
       antialias: true,
       alpha: false,
       powerPreference: 'high-performance',
-      // 导出当前视角时需要保留 WebGL 缓冲区中的像素。
-      preserveDrawingBuffer: true,
     })
     renderer.outputColorSpace = SRGBColorSpace
     renderer.setClearColor(0x101418)
@@ -456,7 +412,7 @@ onMounted(async () => {
     resizeObserver = new ResizeObserver(resizeRenderer)
     resizeObserver.observe(stage.value)
     resizeRenderer()
-    loadTexture(props.image.src)
+    loadTexture(props.image.imageUrl)
   } catch {
     loading.value = false
     loadError.value = true
@@ -475,7 +431,7 @@ watch(
 )
 
 watch(
-  () => props.image.src,
+  () => props.image.imageUrl,
   (source) => {
     stopDrawing()
     loadTexture(source)
@@ -490,6 +446,8 @@ onBeforeUnmount(() => {
   sphere?.geometry.dispose()
   sphere?.material.dispose()
   renderer?.dispose()
+  // 浏览器对并存 WebGL 上下文有限制；切换整组影像时主动归还已销毁查看器的上下文。
+  renderer?.forceContextLoss()
   renderer?.domElement.remove()
 })
 
@@ -513,7 +471,6 @@ defineExpose({
       @pointercancel="finishPointer"
       @wheel="onWheel"
       @keydown="onKeydown"
-      @dblclick="onDoubleClick"
     >
       <div class="image-shade image-shade-top" aria-hidden="true" />
       <div class="image-shade image-shade-bottom" aria-hidden="true" />
@@ -522,7 +479,7 @@ defineExpose({
         <span class="panel-index">{{ String(index + 1).padStart(2, '0') }}</span>
         <div>
           <strong>{{ image.name }}</strong>
-          <span>{{ image.tag }}</span>
+          <span>{{ image.fileName }}</span>
         </div>
       </div>
 
@@ -553,7 +510,7 @@ defineExpose({
         </button>
       </div>
 
-      <div class="draw-tools" @pointerdown.stop @dblclick.stop>
+      <div class="draw-tools" @pointerdown.stop>
         <template v-if="!drawing">
           <button type="button" title="全景描绘" aria-label="全景描绘" @click="startDrawing">
             <PenTool :size="16" />
@@ -570,23 +527,27 @@ defineExpose({
           <button type="button" :disabled="draftPoints.length === 0" title="撤销上一点" aria-label="撤销上一点" @click="undoDraftPoint">
             <Undo2 :size="15" />
           </button>
+          <button type="button" :disabled="draftPoints.length < 3" title="保存区域" aria-label="保存区域" @click="finishDrawing">
+            <Check :size="15" />
+            <span>保存</span>
+          </button>
           <button type="button" title="取消描绘" aria-label="取消描绘" @click="stopDrawing">
             <X :size="15" />
           </button>
-          <small>左键点选，双击结束</small>
+          <small>左键添加点</small>
         </template>
       </div>
 
       <div class="view-reticle" aria-hidden="true"><span /></div>
 
       <svg
-        v-if="visibleRegionPolygons.length || visibleRegionMarkers.length || draftScreenPoints || draftScreenMarkers.length"
+        v-if="screenOverlays.regions.length || screenOverlays.draft.length"
         class="region-screen-layer"
         :viewBox="`0 0 ${stageSize.width} ${stageSize.height}`"
         aria-hidden="true"
       >
         <polygon
-          v-for="item in visibleRegionPolygons"
+          v-for="item in screenOverlays.regions.filter((overlay) => overlay.points)"
           :key="item.region.id"
           :points="item.points"
           :fill="item.region.color"
@@ -594,7 +555,7 @@ defineExpose({
           :stroke="item.region.color"
         />
         <g
-          v-for="marker in visibleRegionMarkers"
+          v-for="marker in screenOverlays.markers"
           :key="marker.id"
           class="region-point-marker"
           :style="{ color: marker.region.color }"
@@ -602,22 +563,22 @@ defineExpose({
           <circle :cx="marker.x" :cy="marker.y" r="5" />
         </g>
         <polygon
-          v-if="draftPoints.length >= 3 && draftScreenPoints"
-          :points="draftScreenPoints"
+          v-if="draftPoints.length >= 3 && screenOverlays.draft.length >= 3"
+          :points="serializePoints(screenOverlays.draft)"
           :fill="regionColor"
           :fill-opacity="regionOpacity"
           :stroke="regionColor"
           class="draft-region"
         />
         <polyline
-          v-else-if="draftPoints.length >= 2 && draftScreenPoints"
-          :points="draftScreenPoints"
+          v-else-if="draftPoints.length >= 2 && screenOverlays.draft.length >= 2"
+          :points="serializePoints(screenOverlays.draft)"
           :stroke="regionColor"
           class="draft-line"
         />
         <g
-          v-for="marker in draftScreenMarkers"
-          :key="marker.id"
+          v-for="(marker, markerIndex) in screenOverlays.draft"
+          :key="`draft-${markerIndex}`"
           class="region-point-marker draft-point-marker"
           :style="{ color: regionColor }"
         >
@@ -626,10 +587,9 @@ defineExpose({
       </svg>
 
       <div class="panel-footer-overlay">
-        <span>{{ image.detail }}</span>
+        <span>{{ imageDetail }}</span>
         <div @pointerdown.stop>
           <button
-            v-if="removable"
             type="button"
             title="移除影像"
             aria-label="移除影像"
@@ -775,6 +735,7 @@ defineExpose({
   display: flex;
   align-items: center;
   gap: 10px;
+  max-width: calc(100% - 220px);
   color: #fff;
   pointer-events: none;
 }
@@ -791,8 +752,16 @@ defineExpose({
 
 .panel-heading div {
   display: grid;
+  min-width: 0;
   gap: 1px;
   text-shadow: 0 1px 4px rgba(0, 0, 0, 0.65);
+}
+
+.panel-heading strong,
+.panel-heading div span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel-heading strong {
@@ -1019,6 +988,12 @@ defineExpose({
   color: rgba(255, 255, 255, 0.68);
   font-size: 11px;
   pointer-events: none;
+}
+
+.panel-footer-overlay > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .panel-footer-overlay > div {

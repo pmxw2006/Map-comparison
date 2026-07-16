@@ -13,6 +13,7 @@ __pycache__/
 *.py[cod]
 dist
 dist-ssr
+.env
 *.local
 
 # 本地上传的原始影像、生成结果和目录数据库需要跨重启保留，但不提交到版本库。

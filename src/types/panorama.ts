@@ -1,57 +1,39 @@
+export type LatLng = [latitude: number, longitude: number]
+
+export type Bounds = [southWest: LatLng, northEast: LatLng]
+
 export interface ViewState {
   yaw: number
   pitch: number
   fov: number
 }
 
-export interface PanoramaItem {
+export interface ImageRecord {
   id: string
   name: string
-  tag: string
-  detail: string
-  src: string
   fileName: string
-  northOffset: number
-  downloadUrl: string
-  createdAt: string
-  latitude: number | null
-  longitude: number | null
+  fileSize: number
+  width: number
+  height: number
+  latitude: number
+  longitude: number
   absoluteAltitude: number | null
   relativeAltitude: number | null
   projectionAltitude: number
-  heading: number | null
-  orthophotoStatus: 'ready' | 'unsupported' | 'processing' | 'failed'
-  orthophotoKind: 'nadir_preview' | 'survey_orthophoto' | null
-  orthophotoUrl: string | null
-  orthophotoDownloadUrl: string | null
-  overlayBounds: [[number, number], [number, number]] | null
+  heading: number
+  // 全景球体正面与相机零度相差 180 度，northOffset 是已经校正后的查看器方位偏移。
+  northOffset: number
+  imageUrl: string
+  downloadUrl: string
+  orthophotoUrl: string
+  orthophotoDownloadUrl: string
+  overlayBounds: Bounds
   nearbyIds: string[]
 }
 
-export interface StoredImageDto {
-  id: string
-  name: string
-  file_name: string
-  mime_type: string
-  file_size: number
-  width: number
-  height: number
-  created_at: string
-  latitude: number | null
-  longitude: number | null
-  absolute_altitude: number | null
-  relative_altitude: number | null
-  projection_altitude: number
-  heading: number | null
-  north_offset: number
-  image_url: string
-  download_url: string
-  orthophoto_status: PanoramaItem['orthophotoStatus']
-  orthophoto_kind: PanoramaItem['orthophotoKind']
-  orthophoto_url: string | null
-  orthophoto_download_url: string | null
-  overlay_bounds: PanoramaItem['overlayBounds']
-  nearby_ids: string[]
+export interface CatalogResponse {
+  images: ImageRecord[]
+  changedIds: string[]
 }
 
 export interface MapRegion {
@@ -60,7 +42,8 @@ export interface MapRegion {
   color: string
   opacity: number
   visible: boolean
-  points: Array<[number, number]>
+  // 固定使用 [纬度, 经度]，与 Leaflet 的坐标顺序一致。
+  points: LatLng[]
 }
 
 export interface PanoramaViewerExpose {

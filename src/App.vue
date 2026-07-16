@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, defineAsyncComponent, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import {
   ArrowLeft,
   Check,
   CheckCircle2,
+  CircleAlert,
   Database,
   Download,
   Eye,
@@ -22,46 +23,53 @@ import {
   Upload,
   X,
 } from '@lucide/vue'
-import OrthophotoMap from './components/OrthophotoMap.vue'
 import PanoramaViewer from './components/PanoramaViewer.vue'
-import type { MapRegion, PanoramaItem, PanoramaViewerExpose, StoredImageDto, ViewState } from './types/panorama'
+import { formatHeading, groundPointToView, normalizeDegrees, signedDegrees } from './geometry'
+import type {
+  CatalogResponse,
+  ImageRecord,
+  LatLng,
+  MapRegion,
+  PanoramaViewerExpose,
+  ViewState,
+} from './types/panorama'
+
+const OrthophotoMap = defineAsyncComponent(() => import('./components/OrthophotoMap.vue'))
 
 const DEFAULT_VIEW: ViewState = { yaw: 0, pitch: -2, fov: 70 }
 const MAX_PANORAMAS = 4
 const REGION_STORAGE_KEY = 'duibi.mapRegions'
 
-const library = ref<PanoramaItem[]>([])
+const library = ref<ImageRecord[]>([])
 const visibleIds = ref<string[]>([])
 const orthophotoVisibleIds = ref<string[]>([])
 const regions = ref<MapRegion[]>(loadStoredRegions())
-const views = ref<ViewState[]>([])
-const activeIndex = ref(0)
-const selectedMapId = ref<string | null>(null)
+const viewsById = ref<Record<string, ViewState>>({})
+const activeImageId = ref<string | null>(null)
 const syncEnabled = ref(true)
 const workspaceMode = ref<'panorama' | 'orthophoto'>('panorama')
 const libraryOpen = ref(false)
 const loadingCatalog = ref(true)
+const catalogError = ref('')
 const uploading = ref(false)
 const isFullscreen = ref(false)
 const filePicker = ref<HTMLInputElement | null>(null)
-const viewerRefs = ref<Array<PanoramaViewerExpose | null>>([])
-const toast = ref('')
+const viewerRefs = ref<Record<string, PanoramaViewerExpose | null>>({})
+const toast = ref<{ message: string; kind: 'success' | 'error' } | null>(null)
 let toastTimer = 0
 
 const panoramas = computed(() =>
-  visibleIds.value.map((id) => library.value.find((item) => item.id === id)).filter(Boolean) as PanoramaItem[],
+  visibleIds.value.map((id) => library.value.find((item) => item.id === id)).filter(Boolean) as ImageRecord[],
 )
-const activeView = computed(() => views.value[activeIndex.value] ?? DEFAULT_VIEW)
-const activePanorama = computed(() => panoramas.value[activeIndex.value] ?? null)
-const normalizedHeading = computed(() => {
-  const offset = activePanorama.value?.northOffset ?? 0
-  return ((Math.round(activeView.value.yaw + offset) % 360) + 360) % 360
-})
+const activeIndex = computed(() => Math.max(0, visibleIds.value.indexOf(activeImageId.value ?? '')))
+const activePanorama = computed(() => library.value.find((item) => item.id === activeImageId.value) ?? null)
+const activeView = computed(() => viewFor(activeImageId.value))
+const mapSelectedId = computed(() => activeImageId.value ?? library.value[0]?.id ?? null)
 const pitchText = computed(() => {
   const pitch = Math.round(activeView.value.pitch)
   return `${pitch > 0 ? '+' : ''}${pitch}°`
 })
-const headingText = computed(() => String(normalizedHeading.value).padStart(3, '0'))
+const headingText = computed(() => formatHeading(activeView.value.yaw + (activePanorama.value?.northOffset ?? 0)))
 const gridClass = computed(() => `count-${Math.min(panoramas.value.length, MAX_PANORAMAS)}`)
 const visibleRegionCount = computed(() => regions.value.filter((region) => region.visible).length)
 
@@ -79,8 +87,8 @@ function loadStoredRegions(): MapRegion[] {
         visible: item.visible !== false,
         points: item.points
           .filter((point: unknown) => Array.isArray(point) && point.length >= 2)
-          .map((point: [number, number]) => [Number(point[0]), Number(point[1])] as [number, number])
-          .filter((point: [number, number]) => Number.isFinite(point[0]) && Number.isFinite(point[1])),
+          .map((point: [number, number]) => [Number(point[0]), Number(point[1])] as LatLng)
+          .filter((point: LatLng) => Number.isFinite(point[0]) && Number.isFinite(point[1])),
       }))
       .filter((item) => item.points.length >= 3)
   } catch {
@@ -88,41 +96,18 @@ function loadStoredRegions(): MapRegion[] {
   }
 }
 
-// 后端接口使用 snake_case；进入 Vue 状态前统一转成 camelCase，模板里就不需要关心接口字段格式。
-function fromDto(item: StoredImageDto): PanoramaItem {
-  return {
-    id: item.id,
-    name: item.name,
-    tag: item.orthophoto_status === 'ready' ? '全景 · 地面反投影已生成' : '全景影像',
-    detail: `${item.width} × ${item.height} · ${(item.file_size / 1024 / 1024).toFixed(1)} MB`,
-    src: item.image_url,
-    fileName: item.file_name,
-    northOffset: item.north_offset,
-    downloadUrl: item.download_url,
-    createdAt: item.created_at,
-    latitude: item.latitude,
-    longitude: item.longitude,
-    absoluteAltitude: item.absolute_altitude,
-    relativeAltitude: item.relative_altitude,
-    projectionAltitude: item.projection_altitude,
-    heading: item.heading,
-    orthophotoStatus: item.orthophoto_status,
-    orthophotoKind: item.orthophoto_kind,
-    orthophotoUrl: item.orthophoto_url,
-    orthophotoDownloadUrl: item.orthophoto_download_url,
-    overlayBounds: item.overlay_bounds,
-    nearbyIds: item.nearby_ids,
-  }
+function imageDetail(item: ImageRecord) {
+  return `${item.width} × ${item.height} · ${(item.fileSize / 1024 / 1024).toFixed(1)} MB`
 }
 
-function setViewerRef(element: unknown, index: number) {
-  viewerRefs.value[index] = (element as PanoramaViewerExpose | null) ?? null
+function setViewerRef(id: string, element: unknown) {
+  viewerRefs.value[id] = (element as PanoramaViewerExpose | null) ?? null
 }
 
-function notify(message: string) {
-  toast.value = message
+function notify(message: string, kind: 'success' | 'error' = 'success') {
+  toast.value = { message, kind }
   window.clearTimeout(toastTimer)
-  toastTimer = window.setTimeout(() => (toast.value = ''), 2800)
+  toastTimer = window.setTimeout(() => (toast.value = null), kind === 'error' ? 5000 : 2800)
 }
 
 async function responseJson<T>(response: Response): Promise<T> {
@@ -131,117 +116,134 @@ async function responseJson<T>(response: Response): Promise<T> {
   throw new Error(payload?.detail ?? `请求失败（${response.status}）`)
 }
 
-function sameLocation(first: PanoramaItem, second: PanoramaItem) {
+function viewFor(id: string | null): ViewState {
+  return id ? viewsById.value[id] ?? DEFAULT_VIEW : DEFAULT_VIEW
+}
+
+function viewAtSameBearing(sourceId: string | null, targetId: string, view: ViewState): ViewState {
+  const source = library.value.find((item) => item.id === sourceId)
+  const target = library.value.find((item) => item.id === targetId)
+  if (!source || !target) return { ...view }
+
+  // yaw 属于单张影像；同步时先还原真实罗盘方位，再换算为目标影像的局部 yaw。
+  return { ...view, yaw: normalizeDegrees(view.yaw + source.northOffset - target.northOffset) }
+}
+
+function sameLocation(first: ImageRecord, second: ImageRecord) {
   if (first.id === second.id) return true
-  if (first.latitude === null || first.longitude === null || second.latitude === null || second.longitude === null) {
-    return false
-  }
   return first.nearbyIds.includes(second.id) || second.nearbyIds.includes(first.id)
 }
 
+// 同位置组以用户选中的影像为锚点，与地图展示的 nearbyIds 规则保持一致。
 function comparableGroup(anchorId: string | null) {
   const anchor = library.value.find((item) => item.id === anchorId) ?? library.value[0]
   if (!anchor) return []
-  const group = [anchor]
-  for (const item of library.value) {
-    if (item.id === anchor.id || group.length >= MAX_PANORAMAS) continue
-    if (group.every((selected) => sameLocation(selected, item))) group.push(item)
-  }
-  return group.map((item) => item.id)
+  return [anchor, ...library.value.filter((item) => item.id !== anchor.id && sameLocation(anchor, item))]
+    .slice(0, MAX_PANORAMAS)
+    .map((item) => item.id)
 }
 
 function sanitizeVisibleIds(ids: string[]) {
-  const existing = ids.map((id) => library.value.find((item) => item.id === id)).filter(Boolean) as PanoramaItem[]
+  const existing = ids.map((id) => library.value.find((item) => item.id === id)).filter(Boolean) as ImageRecord[]
   if (!existing.length) return []
-  const group: PanoramaItem[] = []
-  for (const item of existing) {
-    if (group.length >= MAX_PANORAMAS) break
-    if (group.length === 0 || group.every((selected) => sameLocation(selected, item))) group.push(item)
-  }
-  return group.map((item) => item.id)
+  return existing.filter((item) => sameLocation(existing[0], item)).slice(0, MAX_PANORAMAS).map((item) => item.id)
 }
 
-function canJoinComparison(item: PanoramaItem) {
-  if (visibleIds.value.includes(item.id) || visibleIds.value.length === 0) return true
-  if (visibleIds.value.length >= MAX_PANORAMAS) return false
-  const selected = panoramas.value
-  return selected.every((current) => sameLocation(current, item))
-}
-
-function canReplaceActivePanorama(item: PanoramaItem) {
-  if (visibleIds.value.includes(item.id)) return true
-  if (visibleIds.value.length === 0) return true
-  const activeId = visibleIds.value[activeIndex.value] ?? visibleIds.value[0]
-  const remaining = visibleIds.value
-    .filter((id) => id !== activeId)
-    .map((id) => library.value.find((entry) => entry.id === id))
-    .filter(Boolean) as PanoramaItem[]
-  return remaining.every((current) => sameLocation(current, item))
-}
-
-function canUseLibraryItem(item: PanoramaItem) {
-  if (visibleIds.value.includes(item.id) || visibleIds.value.length < MAX_PANORAMAS) return canJoinComparison(item)
-  return canReplaceActivePanorama(item)
-}
-
-function libraryPanoramaActionLabel(item: PanoramaItem) {
+function libraryPanoramaActionLabel(item: ImageRecord) {
   if (visibleIds.value.includes(item.id)) return '移出当前对比'
-  if (visibleIds.value.length >= MAX_PANORAMAS) return '替换当前活动影像'
+  if (panoramas.value[0] && !sameLocation(panoramas.value[0], item)) return '切换到该位置'
+  if (visibleIds.value.length >= MAX_PANORAMAS) return '替换当前影像'
   return '加入当前对比'
 }
 
-function isOrthophotoReady(item: PanoramaItem) {
-  return Boolean(item.orthophotoUrl && item.overlayBounds)
-}
-
 function sanitizeOrthophotoVisibleIds(ids: string[]) {
-  const ready = new Set(library.value.filter(isOrthophotoReady).map((item) => item.id))
-  const unique = [...new Set(ids)].filter((id) => ready.has(id))
+  const existing = new Set(library.value.map((item) => item.id))
+  const unique = [...new Set(ids)].filter((id) => existing.has(id))
   if (unique.length) return unique
-  const fallback = library.value.find((item) => item.id === selectedMapId.value && isOrthophotoReady(item))
-    ?? library.value.find(isOrthophotoReady)
+  const fallback = library.value.find((item) => item.id === activeImageId.value) ?? library.value[0]
   return fallback ? [fallback.id] : []
 }
 
-// 影像库变化后重建当前对比区的视角数组，避免删除/上传后出现视角和影像错位。
-function rebuildViews() {
-  const source = views.value[activeIndex.value] ?? DEFAULT_VIEW
-  views.value = panoramas.value.map(() => ({ ...source }))
-  viewerRefs.value = []
-  activeIndex.value = Math.min(activeIndex.value, Math.max(0, panoramas.value.length - 1))
-  if (!selectedMapId.value || !library.value.some((item) => item.id === selectedMapId.value)) {
-    selectedMapId.value = panoramas.value[0]?.id ?? library.value[0]?.id ?? null
+// 影像 ID 是状态主键；增删或重新排序不会再把视角错配到另一幅影像。
+function setComparison(ids: string[], focusId: string | null = null) {
+  const nextIds = sanitizeVisibleIds(ids)
+  const nextActiveId = focusId && nextIds.includes(focusId) ? focusId : nextIds[0] ?? null
+  const sourceId = library.value.some((item) => item.id === activeImageId.value) ? activeImageId.value : nextActiveId
+  const source = { ...viewFor(sourceId) }
+  const nextViews = { ...viewsById.value }
+  for (const id of nextIds) {
+    if (syncEnabled.value) nextViews[id] = viewAtSameBearing(sourceId, id, source)
+    else if (!nextViews[id]) nextViews[id] = { ...source }
   }
+  visibleIds.value = nextIds
+  viewsById.value = nextViews
+  activeImageId.value = nextActiveId
+  if (nextActiveId) bringOrthophotoLayerToTop(nextActiveId)
 }
 
-async function loadCatalog(initial = false) {
+function selectForComparison(id: string) {
+  if (!library.value.some((item) => item.id === id)) return
+  setComparison(comparableGroup(id), id)
+}
+
+function removeFromComparison(id: string) {
+  const nextIds = visibleIds.value.filter((current) => current !== id)
+  const nextFocus = activeImageId.value === id ? nextIds[0] ?? null : activeImageId.value
+  setComparison(nextIds, nextFocus)
+}
+
+function applyCatalog(payload: CatalogResponse, focusId: string | null = null) {
+  library.value = payload.images
+  const existing = new Set(payload.images.map((item) => item.id))
+  const retained = sanitizeVisibleIds(visibleIds.value)
+  if (retained.length) setComparison(retained, activeImageId.value)
+  else if (library.value.length) setComparison(comparableGroup(focusId ?? library.value[0].id), focusId)
+  else setComparison([])
+
+  // 先用旧活动视角安置剩余画面，再清除已删除 ID，避免删除活动影像时视角跳回默认值。
+  viewsById.value = Object.fromEntries(Object.entries(viewsById.value).filter(([id]) => existing.has(id)))
+  if (focusId) {
+    activeImageId.value = focusId
+    selectForComparison(focusId)
+  }
+  orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds(orthophotoVisibleIds.value)
+}
+
+async function loadCatalog() {
+  loadingCatalog.value = true
+  catalogError.value = ''
   try {
-    const response = await fetch('/api/images')
-    library.value = (await responseJson<StoredImageDto[]>(response)).map(fromDto)
-    if (initial) visibleIds.value = comparableGroup(library.value[0]?.id ?? null)
-    else visibleIds.value = sanitizeVisibleIds(visibleIds.value)
-    rebuildViews()
-    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds(orthophotoVisibleIds.value)
+    applyCatalog(await responseJson<CatalogResponse>(await fetch('/api/images')))
   } catch (error) {
-    notify(error instanceof Error ? error.message : '无法连接影像服务')
+    catalogError.value = error instanceof Error ? error.message : '无法连接影像服务'
+    notify(catalogError.value, 'error')
   } finally {
     loadingCatalog.value = false
   }
 }
 
-// 同步开启时，任一画面的变化都会广播给当前比较区的全部查看器。
-function handleViewChange(index: number, view: ViewState) {
-  activeIndex.value = index
-  selectedMapId.value = panoramas.value[index]?.id ?? selectedMapId.value
-  if (syncEnabled.value) views.value = views.value.map(() => ({ ...view }))
-  else views.value[index] = { ...view }
+// 同步开启时，任一画面的变化都会按真实罗盘方位广播给全部查看器。
+function handleViewChange(id: string, view: ViewState) {
+  activeImageId.value = id
+  if (syncEnabled.value) {
+    viewsById.value = {
+      ...viewsById.value,
+      ...Object.fromEntries(
+        visibleIds.value.map((visibleId) => [visibleId, viewAtSameBearing(id, visibleId, view)]),
+      ),
+    }
+  } else viewsById.value = { ...viewsById.value, [id]: { ...view } }
 }
 
 function toggleSync() {
   syncEnabled.value = !syncEnabled.value
   if (syncEnabled.value) {
+    const sourceId = activeImageId.value
     const source = { ...activeView.value }
-    views.value = views.value.map(() => ({ ...source }))
+    viewsById.value = {
+      ...viewsById.value,
+      ...Object.fromEntries(visibleIds.value.map((id) => [id, viewAtSameBearing(sourceId, id, source)])),
+    }
     notify('已同步到当前活动视角')
   } else notify('已切换为独立视角')
 }
@@ -252,7 +254,7 @@ function openFilePicker() {
 
 async function handleUpload(event: Event) {
   const input = event.target as HTMLInputElement
-  const selected = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'))
+  const selected = Array.from(input.files ?? [])
   input.value = ''
   if (!selected.length) {
     notify('未选择可用的图片文件')
@@ -263,87 +265,60 @@ async function handleUpload(event: Event) {
   const form = new FormData()
   selected.forEach((file) => form.append('files', file))
   try {
-    // 上传后端会保存原图、提取大疆元数据，并生成可叠加到天地图的地面反投影结果。
-    const uploaded = await responseJson<StoredImageDto[]>(
+    const payload = await responseJson<CatalogResponse>(
       await fetch('/api/images', { method: 'POST', body: form }),
     )
-    const uploadedIds = uploaded.map((item) => item.id)
-    await loadCatalog(false)
-    visibleIds.value = comparableGroup(uploadedIds[0] ?? null)
-    selectedMapId.value = uploadedIds[0] ?? selectedMapId.value
-    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...orthophotoVisibleIds.value, ...uploadedIds])
-    if (uploadedIds[0]) bringOrthophotoLayerToTop(uploadedIds[0])
-    rebuildViews()
-    notify(`已永久保存 ${uploaded.length} 幅影像${selected.length > MAX_PANORAMAS ? '，其余可在影像库中选择' : ''}`)
+    const focusId = payload.changedIds[0] ?? null
+    applyCatalog(payload, focusId)
+    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([
+      ...orthophotoVisibleIds.value,
+      ...payload.changedIds,
+    ])
+    if (focusId) bringOrthophotoLayerToTop(focusId)
+    notify(`已永久保存 ${payload.changedIds.length} 幅影像${selected.length > MAX_PANORAMAS ? '，其余可在影像库中选择' : ''}`)
   } catch (error) {
-    notify(error instanceof Error ? error.message : '上传失败')
+    notify(error instanceof Error ? error.message : '上传失败', 'error')
   } finally {
     uploading.value = false
   }
 }
 
 function toggleLibraryItem(id: string) {
-  const item = library.value.find((entry) => entry.id === id)
-  if (!item) return
-  if (visibleIds.value.includes(id)) {
-    visibleIds.value = visibleIds.value.filter((visibleId) => visibleId !== id)
-  } else if (visibleIds.value.length >= MAX_PANORAMAS) {
-    if (!canReplaceActivePanorama(item)) {
-      notify('只能切换为 20 米内同一坐标位置的全景')
-      return
-    }
-    const replaceIndex = Math.min(activeIndex.value, visibleIds.value.length - 1)
-    visibleIds.value = visibleIds.value.map((visibleId, index) => (index === replaceIndex ? id : visibleId))
-    activeIndex.value = replaceIndex
-    selectedMapId.value = id
-    notify(`已替换当前活动影像`)
-  } else if (!canJoinComparison(item)) {
-    notify('只能加入 20 米内同一坐标位置的全景进行对比')
-    return
-  } else visibleIds.value.push(id)
-  rebuildViews()
+  if (visibleIds.value.includes(id)) removeFromComparison(id)
+  else selectForComparison(id)
 }
 
 function removePanorama(index: number) {
   const item = panoramas.value[index]
   if (!item) return
-  visibleIds.value = visibleIds.value.filter((id) => id !== item.id)
-  rebuildViews()
+  removeFromComparison(item.id)
   notify('已移出当前对比，原文件仍保留在影像库')
 }
 
-async function permanentlyDelete(item: PanoramaItem) {
+async function permanentlyDelete(item: ImageRecord) {
   if (!window.confirm(`永久删除“${item.name}”及其生成结果？`)) return
   try {
-    await responseJson<{ deleted: boolean }>(await fetch(`/api/images/${item.id}`, { method: 'DELETE' }))
-    await loadCatalog(false)
+    applyCatalog(await responseJson<CatalogResponse>(await fetch(`/api/images/${item.id}`, { method: 'DELETE' })))
     notify('影像文件已永久删除')
   } catch (error) {
-    notify(error instanceof Error ? error.message : '删除失败')
+    notify(error instanceof Error ? error.message : '删除失败', 'error')
   }
 }
 
-function downloadOriginal(item: PanoramaItem) {
+function triggerDownload(url: string, filename: string) {
   const anchor = document.createElement('a')
-  anchor.href = item.downloadUrl
-  anchor.download = item.fileName
-  document.body.appendChild(anchor)
+  anchor.href = url
+  anchor.download = filename
   anchor.click()
-  anchor.remove()
+}
+
+function downloadOriginal(item: ImageRecord) {
+  triggerDownload(item.downloadUrl, item.fileName)
   notify(`正在下载 ${item.fileName}`)
 }
 
-function downloadOrthophoto(item: PanoramaItem) {
-  if (!item.orthophotoDownloadUrl) {
-    notify('该影像没有可下载的正射图')
-    return
-  }
-  const anchor = document.createElement('a')
-  anchor.href = item.orthophotoDownloadUrl
-  anchor.download = `${item.name}-orthophoto.jpg`
-  document.body.appendChild(anchor)
-  anchor.click()
-  anchor.remove()
+function downloadOrthophoto(item: ImageRecord) {
+  triggerDownload(item.orthophotoDownloadUrl, `${item.name}-orthophoto.jpg`)
   notify(`正在下载 ${item.name} 正射图`)
 }
 
@@ -356,8 +331,7 @@ function toggleOrthophotoLayer(id: string) {
 }
 
 function bringOrthophotoLayerToTop(id: string) {
-  const item = library.value.find((entry) => entry.id === id)
-  if (!item || !isOrthophotoReady(item)) return
+  if (!library.value.some((entry) => entry.id === id)) return
 
   // Leaflet 按数组后面的图层给更高 z-index；重新放到末尾即可置顶。
   orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([
@@ -366,81 +340,34 @@ function bringOrthophotoLayerToTop(id: string) {
   ])
 }
 
-function ensurePanoramaComparisonForImage(id: string) {
-  const item = library.value.find((entry) => entry.id === id)
-  if (!item) return false
-
-  const existingIndex = visibleIds.value.indexOf(id)
-  if (existingIndex >= 0) {
-    activeIndex.value = existingIndex
-    selectedMapId.value = id
-    return true
-  }
-
-  if (visibleIds.value.length === 0) {
-    visibleIds.value = [id]
-    activeIndex.value = 0
-    selectedMapId.value = id
-    rebuildViews()
-    return true
-  }
-
-  if (visibleIds.value.length < MAX_PANORAMAS && canJoinComparison(item)) {
-    visibleIds.value = sanitizeVisibleIds([...visibleIds.value, id])
-  } else if (canReplaceActivePanorama(item)) {
-    const replaceIndex = Math.min(activeIndex.value, visibleIds.value.length - 1)
-    visibleIds.value = visibleIds.value.map((visibleId, index) => (index === replaceIndex ? id : visibleId))
-    activeIndex.value = replaceIndex
-  } else {
-    // 选中的是另一处坐标时，切换到该坐标的同位置对比组，保持“20 米内才可对比”的约束。
-    visibleIds.value = comparableGroup(id)
-    activeIndex.value = 0
-  }
-
-  rebuildViews()
-  const nextIndex = visibleIds.value.indexOf(id)
-  if (nextIndex >= 0) activeIndex.value = nextIndex
-  selectedMapId.value = id
-  return nextIndex >= 0
-}
-
-function regionCenter(region: MapRegion): [number, number] | null {
+function regionCenter(region: MapRegion): LatLng | null {
   if (!region.points.length) return null
   const sum = region.points.reduce(
-    (total, point) => [total[0] + point[0], total[1] + point[1]] as [number, number],
-    [0, 0] as [number, number],
+    (total, point) => [total[0] + point[0], total[1] + point[1]] as LatLng,
+    [0, 0] as LatLng,
   )
   return [sum[0] / region.points.length, sum[1] / region.points.length]
 }
 
-function viewTowardPoint(image: PanoramaItem, point: [number, number], fallback: ViewState): ViewState {
-  if (image.latitude === null || image.longitude === null) return fallback
-  const latitudeScale = 111_320
-  const longitudeScale = 111_320 * Math.max(0.1, Math.cos((image.latitude * Math.PI) / 180))
-  const north = (point[0] - image.latitude) * latitudeScale
-  const east = (point[1] - image.longitude) * longitudeScale
-  const groundDistance = Math.hypot(east, north)
-  const bearing = normalizeAngle((Math.atan2(east, north) * 180) / Math.PI)
+function viewTowardPoint(image: ImageRecord, point: LatLng, fallback: ViewState): ViewState {
+  const target = groundPointToView(image, point)
   return {
-    yaw: normalizeAngle(bearing - image.northOffset),
-    pitch: Math.max(-82, Math.min(12, -(Math.atan2(image.projectionAltitude, Math.max(groundDistance, 0.5)) * 180) / Math.PI)),
+    yaw: target.yaw,
+    pitch: Math.max(-82, Math.min(12, target.pitch)),
     fov: Math.min(78, Math.max(58, fallback.fov)),
   }
 }
 
 function focusRegionOnPanoramas(region: MapRegion) {
   const center = regionCenter(region)
-  const anchorId = selectedMapId.value ?? activePanorama.value?.id
-  if (anchorId) ensurePanoramaComparisonForImage(anchorId)
+  const anchorId = mapSelectedId.value
+  if (anchorId) selectForComparison(anchorId)
   if (!center || panoramas.value.length === 0) return
-  views.value = panoramas.value.map((image, index) => viewTowardPoint(image, center, views.value[index] ?? DEFAULT_VIEW))
+  viewsById.value = {
+    ...viewsById.value,
+    ...Object.fromEntries(panoramas.value.map((image) => [image.id, viewTowardPoint(image, center, viewFor(image.id))])),
+  }
   notify('区域已保存，全景视角已对准该区域')
-}
-
-function updateRegions(nextRegions: MapRegion[]) {
-  const addedRegion = nextRegions.length > regions.value.length ? nextRegions[nextRegions.length - 1] : null
-  regions.value = nextRegions
-  if (addedRegion) focusRegionOnPanoramas(addedRegion)
 }
 
 function addRegion(region: MapRegion) {
@@ -475,43 +402,24 @@ function kmlColor(color: string, opacity: number) {
   return `${alpha}${blue}${green}${red}`
 }
 
-function regionToKml(region: MapRegion) {
-  const closedPoints = [...region.points, region.points[0]]
-  const coordinates = closedPoints.map(([lat, lng]) => `${lng},${lat},0`).join(' ')
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<kml xmlns="http://www.opengis.net/kml/2.2">
-  <Document>
-    <name>${escapeXml(region.name)}</name>
-    <Style id="region-style">
-      <LineStyle><color>ff${kmlColor(region.color, 1).slice(2)}</color><width>2</width></LineStyle>
-      <PolyStyle><color>${kmlColor(region.color, region.opacity)}</color></PolyStyle>
-    </Style>
-    <Placemark>
-      <name>${escapeXml(region.name)}</name>
-      <styleUrl>#region-style</styleUrl>
-      <Polygon>
-        <outerBoundaryIs>
-          <LinearRing>
-            <coordinates>${coordinates}</coordinates>
-          </LinearRing>
-        </outerBoundaryIs>
-      </Polygon>
-    </Placemark>
-  </Document>
-</kml>`
+function regionsToKml(items: MapRegion[]) {
+  const placemarks = items.map((region) => {
+    const points = [...region.points, region.points[0]]
+    const coordinates = points.map(([lat, lng]) => `${lng},${lat},0`).join(' ')
+    return `<Placemark><name>${escapeXml(region.name)}</name><Style><LineStyle><color>ff${kmlColor(region.color, 1).slice(2)}</color><width>2</width></LineStyle><PolyStyle><color>${kmlColor(region.color, region.opacity)}</color></PolyStyle></Style><Polygon><outerBoundaryIs><LinearRing><coordinates>${coordinates}</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>`
+  }).join('')
+  const name = items.length === 1 ? escapeXml(items[0].name) : '区域图层'
+  return `<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>${name}</name>${placemarks}</Document></kml>`
 }
 
-function downloadText(filename: string, content: string, mimeType: string) {
-  const url = URL.createObjectURL(new Blob([content], { type: mimeType }))
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = filename
-  anchor.click()
-  URL.revokeObjectURL(url)
+function downloadText(filename: string, content: string) {
+  const url = URL.createObjectURL(new Blob([content], { type: 'application/vnd.google-earth.kml+xml' }))
+  triggerDownload(url, filename)
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 function exportRegion(region: MapRegion) {
-  downloadText(`${region.name}.kml`, regionToKml(region), 'application/vnd.google-earth.kml+xml')
+  downloadText(`${region.name}.kml`, regionsToKml([region]))
 }
 
 function exportVisibleRegions() {
@@ -520,34 +428,7 @@ function exportVisibleRegions() {
     notify('当前没有可导出的可见区域')
     return
   }
-  const placemarks = visibleRegions
-    .map((region) => {
-      const closedPoints = [...region.points, region.points[0]]
-      const coordinates = closedPoints.map(([lat, lng]) => `${lng},${lat},0`).join(' ')
-      return `
-    <Placemark>
-      <name>${escapeXml(region.name)}</name>
-      <Style>
-        <LineStyle><color>ff${kmlColor(region.color, 1).slice(2)}</color><width>2</width></LineStyle>
-        <PolyStyle><color>${kmlColor(region.color, region.opacity)}</color></PolyStyle>
-      </Style>
-      <Polygon><outerBoundaryIs><LinearRing><coordinates>${coordinates}</coordinates></LinearRing></outerBoundaryIs></Polygon>
-    </Placemark>`
-    })
-    .join('')
-  downloadText(
-    '区域图层.kml',
-    `<?xml version="1.0" encoding="UTF-8"?><kml xmlns="http://www.opengis.net/kml/2.2"><Document>${placemarks}</Document></kml>`,
-    'application/vnd.google-earth.kml+xml',
-  )
-}
-
-function normalizeAngle(value: number) {
-  return ((value % 360) + 360) % 360
-}
-
-function signedAngle(value: number) {
-  return ((value + 540) % 360) - 180
+  downloadText('区域图层.kml', regionsToKml(visibleRegions))
 }
 
 function hexToRgba(color: string, opacity: number) {
@@ -559,22 +440,14 @@ function hexToRgba(color: string, opacity: number) {
 }
 
 function projectRegionPoint(
-  image: PanoramaItem,
+  image: ImageRecord,
   view: ViewState,
-  point: [number, number],
+  point: LatLng,
   width: number,
   height: number,
 ) {
-  if (image.latitude === null || image.longitude === null) return null
-  const latitudeScale = 111_320
-  const longitudeScale = 111_320 * Math.max(0.1, Math.cos((image.latitude * Math.PI) / 180))
-  const north = (point[0] - image.latitude) * latitudeScale
-  const east = (point[1] - image.longitude) * longitudeScale
-  const groundDistance = Math.hypot(east, north)
-  const bearing = normalizeAngle((Math.atan2(east, north) * 180) / Math.PI)
-  const targetYaw = normalizeAngle(bearing - image.northOffset)
-  const targetPitch = -(Math.atan2(image.projectionAltitude, groundDistance) * 180) / Math.PI
-  const deltaYaw = signedAngle(targetYaw - view.yaw)
+  const target = groundPointToView(image, point)
+  const deltaYaw = signedDegrees(target.yaw - view.yaw)
   if (Math.abs(deltaYaw) > 88) return null
 
   const verticalFov = (view.fov * Math.PI) / 180
@@ -582,28 +455,32 @@ function projectRegionPoint(
   const x = width / 2 + (Math.tan((deltaYaw * Math.PI) / 180) / Math.tan(horizontalFov / 2)) * (width / 2)
   const y =
     height / 2 -
-    (Math.tan(((targetPitch - view.pitch) * Math.PI) / 180) / Math.tan(verticalFov / 2)) * (height / 2)
+    (Math.tan(((target.pitch - view.pitch) * Math.PI) / 180) / Math.tan(verticalFov / 2)) * (height / 2)
   return { x, y }
 }
 
 function drawRegionsOnExport(
   context: CanvasRenderingContext2D,
-  image: PanoramaItem,
+  image: ImageRecord,
   view: ViewState,
-  x: number,
-  y: number,
-  width: number,
-  height: number,
+  cover: ReturnType<typeof drawCover>,
 ) {
   for (const region of regions.value.filter((item) => item.visible && item.points.length >= 3)) {
     const points = region.points
-      .map((point) => projectRegionPoint(image, view, point, width, height))
+      .map((point) => projectRegionPoint(image, view, point, cover.sourceWidth, cover.sourceHeight))
       .filter(Boolean) as Array<{ x: number; y: number }>
     if (points.length < 3) continue
+    const transformed = points.map((point) => ({
+      x: ((point.x - cover.sx) * cover.width) / cover.sw,
+      y: ((point.y - cover.sy) * cover.height) / cover.sh,
+    }))
     context.save()
-    context.translate(x, y)
+    context.translate(cover.x, cover.y)
     context.beginPath()
-    points.forEach((point, index) => {
+    context.rect(0, 0, cover.width, cover.height)
+    context.clip()
+    context.beginPath()
+    transformed.forEach((point, index) => {
       if (index === 0) context.moveTo(point.x, point.y)
       else context.lineTo(point.x, point.y)
     })
@@ -613,7 +490,7 @@ function drawRegionsOnExport(
     context.lineWidth = 4
     context.fill()
     context.stroke()
-    points.forEach((point) => {
+    transformed.forEach((point) => {
       context.beginPath()
       context.arc(point.x, point.y, 9, 0, Math.PI * 2)
       context.fillStyle = region.color
@@ -649,6 +526,7 @@ function drawCover(
     sy = (source.height - sh) / 2
   }
   context.drawImage(source, sx, sy, sw, sh, x, y, width, height)
+  return { sourceWidth: source.width, sourceHeight: source.height, sx, sy, sw, sh, x, y, width, height }
 }
 
 function canvasToBlob(canvas: HTMLCanvasElement) {
@@ -660,19 +538,16 @@ async function exportComparison() {
     notify('请在全景视图中保存当前对比画面')
     return
   }
-  // 先强制每个 Three.js 查看器渲染当前帧，再从 canvas 读取像素生成下载图。
-  const renderers = viewerRefs.value.slice(0, panoramas.value.length)
-  renderers.forEach((viewer) => viewer?.renderNow())
-  await nextTick()
-  await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
-  const sources = renderers.map((viewer) => viewer?.getCanvas()).filter(Boolean) as HTMLCanvasElement[]
-  if (!sources.length) {
+  const entries = panoramas.value
+    .map((image) => ({ image, viewer: viewerRefs.value[image.id] }))
+    .filter((entry) => entry.viewer?.getCanvas())
+  if (!entries.length) {
     notify('当前没有可导出的全景画面')
     return
   }
 
-  const columns = sources.length === 1 ? 1 : 2
-  const rows = Math.ceil(sources.length / columns)
+  const columns = entries.length === 1 ? 1 : 2
+  const rows = Math.ceil(entries.length / columns)
   const cellWidth = 1200
   const cellHeight = 675
   const canvas = document.createElement('canvas')
@@ -682,34 +557,37 @@ async function exportComparison() {
   if (!context) return
   context.fillStyle = '#0e1418'
   context.fillRect(0, 0, canvas.width, canvas.height)
-  sources.forEach((source, index) => {
+  entries.forEach(({ image, viewer }, index) => {
+    // 默认 WebGL 缓冲区只保证当前调用栈可读，因此渲染后立即复制到导出画布。
+    viewer?.renderNow()
+    const source = viewer?.getCanvas()
+    if (!source) return
     const x = (index % columns) * cellWidth
     const y = Math.floor(index / columns) * cellHeight
-    drawCover(context, source, x, y, cellWidth, cellHeight)
-    const image = panoramas.value[index]
-    const view = views.value[index] ?? activeView.value
-    if (image) drawRegionsOnExport(context, image, view, x, y, cellWidth, cellHeight)
+    const cover = drawCover(context, source, x, y, cellWidth, cellHeight)
+    drawRegionsOnExport(context, image, viewFor(image.id), cover)
     context.fillStyle = 'rgba(7, 12, 15, 0.74)'
     context.fillRect(x, y + cellHeight - 58, cellWidth, 58)
     context.fillStyle = '#fff'
     context.font = '600 22px system-ui, sans-serif'
-    context.fillText(panoramas.value[index]?.name ?? `影像 ${index + 1}`, x + 22, y + cellHeight - 23)
+    context.fillText(image.name, x + 22, y + cellHeight - 23)
   })
 
   const blob = await canvasToBlob(canvas)
   if (!blob) return notify('对比图生成失败')
   const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = `全景对比-${new Date().toISOString().slice(0, 10)}.jpg`
-  anchor.click()
-  URL.revokeObjectURL(url)
+  triggerDownload(url, `全景对比-${new Date().toISOString().slice(0, 10)}.jpg`)
+  window.setTimeout(() => URL.revokeObjectURL(url), 0)
   notify('对比图已生成')
 }
 
 async function toggleFullscreen() {
-  if (document.fullscreenElement) await document.exitFullscreen()
-  else await document.documentElement.requestFullscreen()
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen()
+    else await document.documentElement.requestFullscreen()
+  } catch {
+    notify('浏览器拒绝了全屏请求', 'error')
+  }
 }
 
 function goBack() {
@@ -718,9 +596,7 @@ function goBack() {
 }
 
 function selectMapImage(id: string) {
-  selectedMapId.value = id
-  bringOrthophotoLayerToTop(id)
-  ensurePanoramaComparisonForImage(id)
+  selectForComparison(id)
 }
 
 function handleFullscreenChange() {
@@ -729,7 +605,7 @@ function handleFullscreenChange() {
 
 onMounted(() => {
   document.addEventListener('fullscreenchange', handleFullscreenChange)
-  void loadCatalog(true)
+  void loadCatalog()
 })
 
 onBeforeUnmount(() => {
@@ -822,6 +698,13 @@ watch(
         <strong>正在读取影像库</strong>
       </div>
 
+      <div v-else-if="catalogError" class="workspace-state empty-state error-state">
+        <div><CircleAlert :size="30" /></div>
+        <strong>无法读取影像库</strong>
+        <span>{{ catalogError }}</span>
+        <button type="button" @click="loadCatalog">重新连接</button>
+      </div>
+
       <div v-else-if="library.length === 0" class="workspace-state empty-state">
         <div><Upload :size="30" /></div>
         <strong>影像库为空</strong>
@@ -840,15 +723,14 @@ watch(
           <PanoramaViewer
             v-for="(panorama, index) in panoramas"
             :key="panorama.id"
-            :ref="(element) => setViewerRef(element, index)"
+            :ref="(element) => setViewerRef(panorama.id, element)"
             :image="panorama"
-            :view="views[index] ?? DEFAULT_VIEW"
+            :view="viewFor(panorama.id)"
             :index="index"
             :active="activeIndex === index"
-            :removable="true"
             :regions="regions"
-            @activate="activeIndex = index; selectedMapId = panorama.id"
-            @view-change="(view) => handleViewChange(index, view)"
+            @activate="selectForComparison(panorama.id)"
+            @view-change="(view) => handleViewChange(panorama.id, view)"
             @region-create="addRegion"
             @notice="notify"
             @remove="removePanorama(index)"
@@ -859,12 +741,14 @@ watch(
       <OrthophotoMap
         v-else
         :images="library"
-        :selected-id="selectedMapId ?? library[0]?.id ?? null"
+        :selected-id="mapSelectedId"
         :visible-orthophoto-ids="orthophotoVisibleIds"
         :regions="regions"
         @select="selectMapImage"
         @toggle-orthophoto="toggleOrthophotoLayer"
-        @regions-change="updateRegions"
+        @region-create="addRegion"
+        @region-update="updateRegion"
+        @region-delete="deleteRegion"
       />
 
       <Transition name="drawer">
@@ -894,7 +778,7 @@ watch(
               <header class="library-record-heading">
                 <div>
                   <strong>{{ item.name }}</strong>
-                  <span>{{ item.latitude === null ? '无 GPS' : 'GPS 已提取' }} · {{ item.orthophotoStatus === 'ready' ? '地面反投影就绪' : '无反投影预览' }}</span>
+                  <span>GPS 与航向已提取 · 地面反投影就绪</span>
                 </div>
                 <button type="button" class="danger" title="永久删除" aria-label="永久删除" @click="permanentlyDelete(item)">
                   <Trash2 :size="16" />
@@ -904,17 +788,16 @@ watch(
               <section class="library-type-group">
                 <div class="library-type-label">全景原图</div>
                 <div class="library-child-card">
-                  <img :src="item.src" :alt="`${item.name}全景原图`" />
+                  <img :src="item.imageUrl" :alt="`${item.name}全景原图`" loading="lazy" decoding="async" />
                   <div class="library-item-info">
                     <strong>360 全景</strong>
-                    <span>{{ item.detail }}</span>
+                    <span>{{ imageDetail(item) }}</span>
                     <small>{{ item.fileName }}</small>
                   </div>
                   <div class="library-item-actions">
                     <button
                       type="button"
                       :class="{ active: visibleIds.includes(item.id) }"
-                      :disabled="!canUseLibraryItem(item)"
                       :title="libraryPanoramaActionLabel(item)"
                       :aria-label="libraryPanoramaActionLabel(item)"
                       @click="toggleLibraryItem(item.id)"
@@ -931,8 +814,8 @@ watch(
 
               <section class="library-type-group">
                 <div class="library-type-label">转换正射图</div>
-                <div v-if="item.orthophotoUrl" class="library-child-card">
-                  <img :src="item.orthophotoUrl" :alt="`${item.name}转换正射图`" />
+                <div class="library-child-card">
+                  <img :src="item.orthophotoUrl" :alt="`${item.name}转换正射图`" loading="lazy" decoding="async" />
                   <div class="library-item-info">
                     <strong>500 m × 500 m</strong>
                     <span>平坦地面反投影预览</span>
@@ -951,21 +834,12 @@ watch(
                     </button>
                     <button
                       type="button"
-                      :disabled="!item.orthophotoDownloadUrl"
                       title="下载正射图"
                       aria-label="下载正射图"
                       @click="downloadOrthophoto(item)"
                     >
                       <Download :size="16" />
                     </button>
-                  </div>
-                </div>
-                <div v-else class="library-child-card is-empty">
-                  <div class="library-empty-preview"><Map :size="18" /></div>
-                  <div class="library-item-info">
-                    <strong>未生成</strong>
-                    <span>非 2:1 全景或缺少可处理内容</span>
-                    <small>无可下载正射图</small>
                   </div>
                 </div>
               </section>
@@ -1036,9 +910,10 @@ watch(
     </footer>
 
     <Transition name="toast">
-      <div v-if="toast" class="toast-message" role="status">
-        <CheckCircle2 :size="17" />
-        <span>{{ toast }}</span>
+      <div v-if="toast" class="toast-message" :class="{ error: toast.kind === 'error' }" role="status">
+        <CircleAlert v-if="toast.kind === 'error'" :size="17" />
+        <CheckCircle2 v-else :size="17" />
+        <span>{{ toast.message }}</span>
       </div>
     </Transition>
   </div>
