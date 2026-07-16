@@ -186,6 +186,17 @@ function undoDraftPoint() {
   draftPoints.value = draftPoints.value.slice(0, -1)
 }
 
+function trimDuplicateDraftEnd() {
+  const points = draftPoints.value
+  if (points.length < 2) return
+  const previous = points[points.length - 2]
+  const last = points[points.length - 1]
+  // 双击确认前会先触发两次落点；若最后两个点几乎重合，只移除第二次落点。
+  if (Math.abs(previous[0] - last[0]) < 1e-9 && Math.abs(previous[1] - last[1]) < 1e-9) {
+    draftPoints.value = points.slice(0, -1)
+  }
+}
+
 function addDraftPoint(event: PointerEvent) {
   const point = screenToGroundPoint(event.clientX, event.clientY)
   if (!point) {
@@ -211,6 +222,14 @@ function finishDrawing() {
   emit('region-create', nextRegion)
   regionName.value = ''
   stopDrawing()
+}
+
+function finishDrawingByDoubleClick(event: MouseEvent) {
+  if (!drawing.value) return
+  event.preventDefault()
+  event.stopPropagation()
+  trimDuplicateDraftEnd()
+  finishDrawing()
 }
 
 // 将经纬式的 yaw / pitch 转换成球心向外的观察向量。
@@ -469,6 +488,7 @@ defineExpose({
       @pointermove="onPointerMove"
       @pointerup="finishPointer"
       @pointercancel="finishPointer"
+      @dblclick="finishDrawingByDoubleClick"
       @wheel="onWheel"
       @keydown="onKeydown"
     >
@@ -527,14 +547,14 @@ defineExpose({
           <button type="button" :disabled="draftPoints.length === 0" title="撤销上一点" aria-label="撤销上一点" @click="undoDraftPoint">
             <Undo2 :size="15" />
           </button>
-          <button type="button" :disabled="draftPoints.length < 3" title="保存区域" aria-label="保存区域" @click="finishDrawing">
+          <button type="button" :disabled="draftPoints.length < 3" title="保存确认" aria-label="保存区域" @click="finishDrawing">
             <Check :size="15" />
-            <span>保存</span>
+            <span>保存确认</span>
           </button>
           <button type="button" title="取消描绘" aria-label="取消描绘" @click="stopDrawing">
             <X :size="15" />
           </button>
-          <small>左键添加点</small>
+          <small>左键加点，双击或保存确认</small>
         </template>
       </div>
 

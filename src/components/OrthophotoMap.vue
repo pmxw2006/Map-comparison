@@ -251,6 +251,18 @@ function undoDraftPoint() {
   redrawDraft()
 }
 
+function trimDuplicateDraftEnd() {
+  const points = draftPoints.value
+  if (points.length < 2) return
+  const previous = points[points.length - 2]
+  const last = points[points.length - 1]
+  // 双击确认前 Leaflet 会先触发两次 click；若最后两个点重合，只保留第一次落点。
+  if (Math.abs(previous[0] - last[0]) < 1e-9 && Math.abs(previous[1] - last[1]) < 1e-9) {
+    draftPoints.value = points.slice(0, -1)
+    redrawDraft()
+  }
+}
+
 function finishDrawing() {
   if (draftPoints.value.length < 3) return
   const nextRegion: MapRegion = {
@@ -264,6 +276,13 @@ function finishDrawing() {
   emit('region-create', nextRegion)
   regionName.value = ''
   stopDrawing()
+}
+
+function handleMapDoubleClick(event: LeafletMouseEvent) {
+  if (!drawing.value) return
+  event.originalEvent.preventDefault()
+  trimDuplicateDraftEnd()
+  finishDrawing()
 }
 
 function updateRegion(id: string, patch: Partial<MapRegion>) {
@@ -304,6 +323,7 @@ onMounted(() => {
   regionLayer = L.layerGroup().addTo(map)
   draftLayer = L.layerGroup().addTo(map)
   map.on('click', handleMapClick)
+  map.on('dblclick', handleMapDoubleClick)
   rebuildMarkers()
   rebuildOrthophotoOverlays(true)
   rebuildRegionLayer()
@@ -323,6 +343,7 @@ watch([regionColor, regionOpacity], () => redrawDraft())
 
 onBeforeUnmount(() => {
   map?.off('click', handleMapClick)
+  map?.off('dblclick', handleMapDoubleClick)
   map?.remove()
   map = null
 })
@@ -407,7 +428,7 @@ onBeforeUnmount(() => {
         <div class="draw-buttons">
           <button v-if="!drawing" type="button" @click="startDrawing"><PenTool :size="14" /> 开始描绘</button>
           <template v-else>
-            <button type="button" :disabled="draftPoints.length < 3" @click="finishDrawing">保存当前</button>
+            <button type="button" :disabled="draftPoints.length < 3" aria-label="保存当前" @click="finishDrawing">保存确认</button>
             <button type="button" :disabled="draftPoints.length === 0" title="撤销上一点" aria-label="撤销上一点" @click="undoDraftPoint">
               <Undo2 :size="14" />
             </button>
@@ -741,6 +762,14 @@ onBeforeUnmount(() => {
 }
 
 :global(.image-map-marker-host) { background: transparent; border: 0; }
+:global(.image-map-marker-host.leaflet-interactive),
+:global(.image-map-marker-host.leaflet-interactive .image-map-marker) {
+  cursor: default;
+}
+.orthophoto-map.drawing :global(.image-map-marker-host.leaflet-interactive),
+.orthophoto-map.drawing :global(.image-map-marker-host.leaflet-interactive .image-map-marker) {
+  cursor: crosshair;
+}
 :global(.image-map-marker) {
   display: block;
   width: 30px;
