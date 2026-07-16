@@ -333,9 +333,15 @@ function downloadOriginal(item: ImageRecord) {
   notify(`正在下载 ${item.fileName}`)
 }
 
-function downloadOrthophoto(item: ImageRecord) {
-  triggerDownload(item.orthophotoDownloadUrl, `${item.name}-orthophoto.jpg`)
-  notify(`正在下载 ${item.name} 正射图`)
+function downloadOrthophoto(item: ImageRecord, format: 'jpg' | 'tif' | 'tiff' | 'mbtiles' = 'jpg') {
+  const downloads = {
+    jpg: item.orthophotoDownloadUrl,
+    tif: item.orthophotoTifDownloadUrl,
+    tiff: item.orthophotoTiffDownloadUrl,
+    mbtiles: item.orthophotoMbtilesDownloadUrl,
+  }
+  triggerDownload(downloads[format], `${item.name}-orthophoto.${format}`)
+  notify(`正在下载 ${item.name} 正射图（.${format}）`)
 }
 
 function toggleOrthophotoLayer(id: string) {
@@ -851,11 +857,27 @@ watch(
                     </button>
                     <button
                       type="button"
-                      title="下载正射图"
+                      title="下载 JPG 预览"
                       aria-label="下载正射图"
                       @click="downloadOrthophoto(item)"
                     >
                       <Download :size="16" />
+                    </button>
+                    <button
+                      type="button"
+                      title="下载 GeoTIFF（.tif，含定位）"
+                      aria-label="下载 GeoTIFF"
+                      @click="downloadOrthophoto(item, 'tif')"
+                    >
+                      TIF
+                    </button>
+                    <button
+                      type="button"
+                      title="下载 MBTiles（.mbtiles，含定位）"
+                      aria-label="下载 MBTiles"
+                      @click="downloadOrthophoto(item, 'mbtiles')"
+                    >
+                      MB
                     </button>
                   </div>
                 </div>

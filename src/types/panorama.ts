@@ -27,6 +27,9 @@ export interface ImageRecord {
   downloadUrl: string
   orthophotoUrl: string
   orthophotoDownloadUrl: string
+  orthophotoTifDownloadUrl: string
+  orthophotoTiffDownloadUrl: string
+  orthophotoMbtilesDownloadUrl: string
   overlayBounds: Bounds
   nearbyIds: string[]
 }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 import json
 import logging
 import math
@@ -20,6 +21,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import ExifTags, Image, UnidentifiedImageError
+from PIL.TiffImagePlugin import ImageFileDirectory_v2
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -33,6 +35,15 @@ NEARBY_DISTANCE_METERS = 20.0
 ORTHOPHOTO_FOOTPRINT_METERS = 500.0
 DEFAULT_PROJECTION_ALTITUDE_METERS = 120.0
 GEOCODE_TIMEOUT_SECONDS = 4
+MBTILES_TILE_SIZE = 256
+MBTILES_MIN_ZOOM = 16
+MBTILES_MAX_ZOOM = 19
+WEB_MERCATOR_MAX_LATITUDE = 85.05112878
+
+GEOTIFF_MODEL_PIXEL_SCALE_TAG = 33550
+GEOTIFF_MODEL_TIEPOINT_TAG = 33922
+GEOTIFF_GEO_KEY_DIRECTORY_TAG = 34735
+GEOTIFF_GEO_ASCII_PARAMS_TAG = 34737
 
 # 方向链路必须分开：Three.js 的 yaw=0 位于全景接缝，需加 180°；正射采样以图像中心为航向，不加修正。
 PANORAMA_VIEW_NORTH_CORRECTION_DEGREES = 180.0
@@ -244,6 +255,191 @@ def overlay_bounds(latitude: float, longitude: float) -> list[list[float]]:
     ]
 
 
+def bounds_values(latitude: float, longitude: float) -> tuple[float, float, float, float]:
+    south_west, north_east = overlay_bounds(latitude, longitude)
+    return south_west[1], south_west[0], north_east[1], north_east[0]
+
+
+def orthophoto_export_path(row: sqlite3.Row, extension: str) -> Path:
+    return ORTHOPHOTO_DIR / f"{Path(row['orthophoto_name']).stem}.{extension}"
+
+
+def orthophoto_sidecar_paths(row: sqlite3.Row) -> list[Path]:
+    return [
+        ORTHOPHOTO_DIR / row["orthophoto_name"],
+        orthophoto_export_path(row, "tif"),
+        orthophoto_export_path(row, "tiff"),
+        orthophoto_export_path(row, "mbtiles"),
+    ]
+
+
+def orthophoto_metadata(row: sqlite3.Row, width: int, height: int) -> dict[str, Any]:
+    west, south, east, north = bounds_values(row["latitude"], row["longitude"])
+    return {
+        "generator": "DuiBi",
+        "type": "orthophoto-preview",
+        "crs": "EPSG:4326",
+        "imageId": row["id"],
+        "sourceFile": row["original_name"],
+        "centerLatitude": row["latitude"],
+        "centerLongitude": row["longitude"],
+        "west": west,
+        "south": south,
+        "east": east,
+        "north": north,
+        "widthPixels": width,
+        "heightPixels": height,
+        "footprintMeters": ORTHOPHOTO_FOOTPRINT_METERS,
+        "headingDegrees": row["heading"],
+        "absoluteAltitudeMeters": row["absolute_altitude"],
+        "relativeAltitudeMeters": row["relative_altitude"],
+        "projectionAltitudeMeters": projection_altitude_meters(row["relative_altitude"]),
+    }
+
+
+def build_geotiff(row: sqlite3.Row, target_path: Path) -> Path:
+    source_path = ORTHOPHOTO_DIR / row["orthophoto_name"]
+    if target_path.exists() and target_path.stat().st_mtime >= source_path.stat().st_mtime:
+        return target_path
+
+    with Image.open(source_path) as image:
+        image = image.convert("RGB")
+        width, height = image.size
+        west, south, east, north = bounds_values(row["latitude"], row["longitude"])
+        longitude_scale = (east - west) / width
+        latitude_scale = (north - south) / height
+        metadata = orthophoto_metadata(row, width, height)
+
+        tiff_info = ImageFileDirectory_v2()
+        tiff_info[269] = f"{Path(row['original_name']).stem}-orthophoto"
+        tiff_info[270] = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+        tiff_info[305] = "DuiBi"
+        tiff_info[306] = datetime.now(timezone.utc).strftime("%Y:%m:%d %H:%M:%S")
+        # GeoTIFF 基础定位：左上角经纬度 + 每像素经纬度比例，坐标系为 WGS84/EPSG:4326。
+        tiff_info[GEOTIFF_MODEL_PIXEL_SCALE_TAG] = (longitude_scale, latitude_scale, 0.0)
+        tiff_info[GEOTIFF_MODEL_TIEPOINT_TAG] = (0.0, 0.0, 0.0, west, north, 0.0)
+        ascii_params = "WGS 84|DuiBi orthophoto preview|"
+        geo_keys = (
+            1, 1, 0, 6,
+            1024, 0, 1, 2,  # GTModelTypeGeoKey = Geographic
+            1025, 0, 1, 1,  # GTRasterTypeGeoKey = RasterPixelIsArea
+            1026, GEOTIFF_GEO_ASCII_PARAMS_TAG, len(ascii_params), 0,
+            2048, 0, 1, 4326,  # GeographicTypeGeoKey = EPSG:4326
+            2049, GEOTIFF_GEO_ASCII_PARAMS_TAG, len(ascii_params), 0,
+            2054, 0, 1, 9102,  # GeogAngularUnitsGeoKey = degree
+        )
+        tiff_info[GEOTIFF_GEO_KEY_DIRECTORY_TAG] = geo_keys
+        tiff_info[GEOTIFF_GEO_ASCII_PARAMS_TAG] = ascii_params
+        image.save(target_path, "TIFF", compression="tiff_deflate", tiffinfo=tiff_info)
+    return target_path
+
+
+def clamp_tile(value: int, zoom: int) -> int:
+    return min((1 << zoom) - 1, max(0, value))
+
+
+def longitude_to_tile_x(longitude: float, zoom: int) -> int:
+    return clamp_tile(math.floor((longitude + 180.0) / 360.0 * (1 << zoom)), zoom)
+
+
+def latitude_to_tile_y(latitude: float, zoom: int) -> int:
+    latitude = max(-WEB_MERCATOR_MAX_LATITUDE, min(WEB_MERCATOR_MAX_LATITUDE, latitude))
+    radians = math.radians(latitude)
+    value = (1.0 - math.log(math.tan(radians) + 1.0 / math.cos(radians)) / math.pi) / 2.0
+    return clamp_tile(math.floor(value * (1 << zoom)), zoom)
+
+
+def tile_png(source_pixels: np.ndarray, bounds: tuple[float, float, float, float], zoom: int, tile_x: int, tile_y: int) -> bytes | None:
+    west, south, east, north = bounds
+    source_height, source_width = source_pixels.shape[:2]
+    scale = 1 << zoom
+    columns = tile_x * MBTILES_TILE_SIZE + np.arange(MBTILES_TILE_SIZE) + 0.5
+    rows = tile_y * MBTILES_TILE_SIZE + np.arange(MBTILES_TILE_SIZE) + 0.5
+    longitudes = columns / (scale * MBTILES_TILE_SIZE) * 360.0 - 180.0
+    mercator = math.pi * (1.0 - 2.0 * rows / (scale * MBTILES_TILE_SIZE))
+    latitudes = np.degrees(np.arctan(np.sinh(mercator)))
+    longitude_grid, latitude_grid = np.meshgrid(longitudes, latitudes)
+    inside = (longitude_grid >= west) & (longitude_grid <= east) & (latitude_grid >= south) & (latitude_grid <= north)
+    if not inside.any():
+        return None
+
+    source_x = ((longitude_grid - west) / (east - west) * source_width).astype(np.int32)
+    source_y = ((north - latitude_grid) / (north - south) * source_height).astype(np.int32)
+    np.clip(source_x, 0, source_width - 1, out=source_x)
+    np.clip(source_y, 0, source_height - 1, out=source_y)
+
+    output = np.zeros((MBTILES_TILE_SIZE, MBTILES_TILE_SIZE, 4), dtype=np.uint8)
+    output[inside] = source_pixels[source_y[inside], source_x[inside]]
+    buffer = BytesIO()
+    Image.fromarray(output, mode="RGBA").save(buffer, "PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def build_mbtiles(row: sqlite3.Row, target_path: Path) -> Path:
+    source_path = ORTHOPHOTO_DIR / row["orthophoto_name"]
+    if target_path.exists() and target_path.stat().st_mtime >= source_path.stat().st_mtime:
+        return target_path
+
+    with Image.open(source_path) as image:
+        image = image.convert("RGBA")
+        source_pixels = np.asarray(image)
+        width, height = image.size
+
+    bounds = bounds_values(row["latitude"], row["longitude"])
+    west, south, east, north = bounds
+    metadata = orthophoto_metadata(row, width, height)
+    temp_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
+    temp_path.unlink(missing_ok=True)
+
+    with sqlite3.connect(temp_path) as connection:
+        connection.execute("CREATE TABLE metadata (name TEXT, value TEXT)")
+        connection.execute("CREATE TABLE tiles (zoom_level INTEGER, tile_column INTEGER, tile_row INTEGER, tile_data BLOB)")
+        connection.executemany(
+            "INSERT INTO metadata (name, value) VALUES (?, ?)",
+            [
+                ("name", f"{Path(row['original_name']).stem}-orthophoto"),
+                ("type", "overlay"),
+                ("version", "1.3"),
+                ("description", json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))),
+                ("format", "png"),
+                ("scheme", "tms"),
+                ("bounds", f"{west:.10f},{south:.10f},{east:.10f},{north:.10f}"),
+                ("center", f"{row['longitude']:.10f},{row['latitude']:.10f},{MBTILES_MAX_ZOOM}"),
+                ("minzoom", str(MBTILES_MIN_ZOOM)),
+                ("maxzoom", str(MBTILES_MAX_ZOOM)),
+                ("attribution", "DuiBi orthophoto preview"),
+                ("duibi:image_id", row["id"]),
+                ("duibi:source_file", row["original_name"]),
+                ("duibi:crs", "EPSG:3857 tiles / EPSG:4326 bounds"),
+                ("duibi:footprint_meters", str(ORTHOPHOTO_FOOTPRINT_METERS)),
+                ("duibi:heading_degrees", str(row["heading"])),
+                ("duibi:center_latitude", str(row["latitude"])),
+                ("duibi:center_longitude", str(row["longitude"])),
+            ],
+        )
+
+        for zoom in range(MBTILES_MIN_ZOOM, MBTILES_MAX_ZOOM + 1):
+            min_x = longitude_to_tile_x(west, zoom)
+            max_x = longitude_to_tile_x(east, zoom)
+            min_y = latitude_to_tile_y(north, zoom)
+            max_y = latitude_to_tile_y(south, zoom)
+            for tile_x in range(min_x, max_x + 1):
+                for tile_y in range(min_y, max_y + 1):
+                    data = tile_png(source_pixels, bounds, zoom, tile_x, tile_y)
+                    if data is None:
+                        continue
+                    # MBTiles 规范使用 TMS 行号：从南向北编号；Web 地图 XYZ 行号需反转。
+                    tms_y = (1 << zoom) - 1 - tile_y
+                    connection.execute(
+                        "INSERT INTO tiles (zoom_level, tile_column, tile_row, tile_data) VALUES (?, ?, ?, ?)",
+                        (zoom, tile_x, tms_y, data),
+                    )
+        connection.execute("CREATE UNIQUE INDEX tile_index ON tiles (zoom_level, tile_column, tile_row)")
+
+    temp_path.replace(target_path)
+    return target_path
+
+
 def catalog_response(changed_ids: list[str]) -> dict[str, Any]:
     with database() as connection:
         rows = connection.execute("SELECT * FROM images ORDER BY created_at DESC").fetchall()
@@ -269,6 +465,9 @@ def catalog_response(changed_ids: list[str]) -> dict[str, Any]:
                 "downloadUrl": f"/api/images/{row['id']}/download",
                 "orthophotoUrl": f"/media/orthophotos/{row['orthophoto_name']}",
                 "orthophotoDownloadUrl": f"/api/images/{row['id']}/orthophoto/download",
+                "orthophotoTifDownloadUrl": f"/api/images/{row['id']}/orthophoto/download?format=tif",
+                "orthophotoTiffDownloadUrl": f"/api/images/{row['id']}/orthophoto/download?format=tiff",
+                "orthophotoMbtilesDownloadUrl": f"/api/images/{row['id']}/orthophoto/download?format=mbtiles",
                 "overlayBounds": overlay_bounds(row["latitude"], row["longitude"]),
                 "nearbyIds": [
                     other["id"]
@@ -465,16 +664,36 @@ def download_image(image_id: str) -> FileResponse:
 
 
 @app.get("/api/images/{image_id}/orthophoto/download")
-def download_orthophoto(image_id: str) -> FileResponse:
+def download_orthophoto(image_id: str, format: str = "jpg") -> FileResponse:
     with database() as connection:
         row = connection.execute("SELECT * FROM images WHERE id = ?", (image_id,)).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="正射图不存在")
-    return FileResponse(
-        ORTHOPHOTO_DIR / row["orthophoto_name"],
-        filename=f"{Path(row['original_name']).stem}-orthophoto.jpg",
-        media_type="image/jpeg",
-    )
+
+    normalized_format = format.lower().lstrip(".")
+    base_name = f"{Path(row['original_name']).stem}-orthophoto"
+    if normalized_format in {"jpg", "jpeg"}:
+        return FileResponse(
+            ORTHOPHOTO_DIR / row["orthophoto_name"],
+            filename=f"{base_name}.jpg",
+            media_type="image/jpeg",
+        )
+    if normalized_format in {"tif", "tiff"}:
+        path = build_geotiff(row, orthophoto_export_path(row, normalized_format))
+        return FileResponse(
+            path,
+            filename=f"{base_name}.{normalized_format}",
+            media_type="image/tiff",
+        )
+    if normalized_format == "mbtiles":
+        path = build_mbtiles(row, orthophoto_export_path(row, "mbtiles"))
+        return FileResponse(
+            path,
+            filename=f"{base_name}.mbtiles",
+            media_type="application/x-sqlite3",
+        )
+
+    raise HTTPException(status_code=400, detail="正射图仅支持 jpg、tif、tiff、mbtiles")
 
 
 @app.delete("/api/images/{image_id}")
@@ -485,7 +704,7 @@ def delete_image(image_id: str) -> dict[str, Any]:
             raise HTTPException(status_code=404, detail="影像不存在")
         connection.execute("DELETE FROM images WHERE id = ?", (image_id,))
 
-    clean_paths([IMAGE_DIR / row["stored_name"], ORTHOPHOTO_DIR / row["orthophoto_name"]])
+    clean_paths([IMAGE_DIR / row["stored_name"], *orthophoto_sidecar_paths(row)])
     return catalog_response([image_id])
 
 
