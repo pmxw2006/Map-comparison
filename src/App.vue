@@ -186,6 +186,22 @@ function selectForComparison(id: string) {
   setComparison(comparableGroup(id), id)
 }
 
+function activatePanorama(id: string) {
+  if (!visibleIds.value.includes(id)) {
+    selectForComparison(id)
+    return
+  }
+  activeImageId.value = id
+  if (syncEnabled.value) {
+    const source = { ...viewFor(id) }
+    viewsById.value = {
+      ...viewsById.value,
+      ...Object.fromEntries(visibleIds.value.map((visibleId) => [visibleId, viewAtSameBearing(id, visibleId, source)])),
+    }
+  }
+  bringOrthophotoLayerToTop(id)
+}
+
 function removeFromComparison(id: string) {
   const nextIds = visibleIds.value.filter((current) => current !== id)
   const nextFocus = activeImageId.value === id ? nextIds[0] ?? null : activeImageId.value
@@ -729,7 +745,8 @@ watch(
             :index="index"
             :active="activeIndex === index"
             :regions="regions"
-            @activate="selectForComparison(panorama.id)"
+            @activate="activatePanorama(panorama.id)"
+            @focus-comparison="selectForComparison(panorama.id)"
             @view-change="(view) => handleViewChange(panorama.id, view)"
             @region-create="addRegion"
             @notice="notify"

@@ -27,6 +27,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   activate: []
+  'focus-comparison': []
   'view-change': [view: ViewState]
   'region-create': [region: MapRegion]
   notice: [message: string]
@@ -58,6 +59,7 @@ let dragStartX = 0
 let dragStartY = 0
 let dragStartYaw = 0
 let dragStartPitch = 0
+let movedDuringPointer = false
 
 const clamp = (value: number, min: number, max: number) => Math.min(max, Math.max(min, value))
 const heading = computed(() => normalizeDegrees(Math.round(localView.yaw + props.image.northOffset)))
@@ -328,6 +330,7 @@ function onPointerDown(event: PointerEvent) {
   dragStartY = event.clientY
   dragStartYaw = localView.yaw
   dragStartPitch = localView.pitch
+  movedDuringPointer = false
   stage.value?.setPointerCapture(event.pointerId)
   stage.value?.focus({ preventScroll: true })
   emit('activate')
@@ -336,19 +339,25 @@ function onPointerDown(event: PointerEvent) {
 function onPointerMove(event: PointerEvent) {
   if (drawing.value) return
   if (!dragging.value || pointerId !== event.pointerId) return
+  const deltaX = event.clientX - dragStartX
+  const deltaY = event.clientY - dragStartY
+  if (Math.abs(deltaX) + Math.abs(deltaY) > 3) movedDuringPointer = true
   // 拖拽只更新当前查看器的视角；父组件根据“视角同步”开关决定是否广播给其他全景。
   publishView({
-    yaw: dragStartYaw - (event.clientX - dragStartX) * 0.16,
-    pitch: dragStartPitch + (event.clientY - dragStartY) * 0.13,
+    yaw: dragStartYaw - deltaX * 0.16,
+    pitch: dragStartPitch + deltaY * 0.13,
   })
 }
 
 function finishPointer(event: PointerEvent) {
   if (drawing.value) return
   if (pointerId !== event.pointerId) return
+  const shouldFocusComparison = event.type === 'pointerup' && !movedDuringPointer
   if (stage.value?.hasPointerCapture(event.pointerId)) stage.value.releasePointerCapture(event.pointerId)
   pointerId = null
   dragging.value = false
+  movedDuringPointer = false
+  if (shouldFocusComparison) emit('focus-comparison')
 }
 
 function onWheel(event: WheelEvent) {

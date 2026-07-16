@@ -383,6 +383,26 @@ try {
   if (afterDrag[0] === beforeDrag[0] || afterDrag.some((value) => value !== afterDrag[0])) {
     throw new Error(`Panorama synchronization failed: ${JSON.stringify({ beforeDrag, afterDrag })}`)
   }
+  const filesBeforeSecondDrag = await page.locator('.panorama-panel .panel-heading span:not(.panel-index)').allTextContents()
+  const secondStageBox = await page.locator('.panorama-stage').nth(1).boundingBox()
+  if (!secondStageBox) throw new Error('The second panorama stage has no layout box')
+  await page.mouse.move(secondStageBox.x + secondStageBox.width * 0.55, secondStageBox.y + secondStageBox.height * 0.55)
+  await page.mouse.down()
+  await page.mouse.move(secondStageBox.x + secondStageBox.width * 0.42, secondStageBox.y + secondStageBox.height * 0.5, { steps: 8 })
+  await page.mouse.up()
+  await page.waitForTimeout(150)
+  const filesAfterSecondDrag = await page.locator('.panorama-panel .panel-heading span:not(.panel-index)').allTextContents()
+  const afterSecondDrag = await orientation.allTextContents()
+  if (JSON.stringify(filesAfterSecondDrag) !== JSON.stringify(filesBeforeSecondDrag)
+    || afterSecondDrag[0] === afterDrag[0]
+    || afterSecondDrag.some((value) => value !== afterSecondDrag[0])) {
+    throw new Error(`Secondary panorama drag failed: ${JSON.stringify({
+      filesBeforeSecondDrag,
+      filesAfterSecondDrag,
+      afterDrag,
+      afterSecondDrag,
+    })}`)
+  }
 
   const syncButton = page.getByRole('button', { name: '视角同步', exact: true })
   await syncButton.click()
