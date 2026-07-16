@@ -271,7 +271,8 @@ async function handleUpload(event: Event) {
     await loadCatalog(false)
     visibleIds.value = comparableGroup(uploadedIds[0] ?? null)
     selectedMapId.value = uploadedIds[0] ?? selectedMapId.value
-    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...uploadedIds, ...orthophotoVisibleIds.value])
+    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...orthophotoVisibleIds.value, ...uploadedIds])
+    if (uploadedIds[0]) bringOrthophotoLayerToTop(uploadedIds[0])
     rebuildViews()
     notify(`已永久保存 ${uploaded.length} 幅影像${selected.length > MAX_PANORAMAS ? '，其余可在影像库中选择' : ''}`)
   } catch (error) {
@@ -354,6 +355,55 @@ function toggleOrthophotoLayer(id: string) {
   }
 }
 
+function bringOrthophotoLayerToTop(id: string) {
+  const item = library.value.find((entry) => entry.id === id)
+  if (!item || !isOrthophotoReady(item)) return
+
+  // Leaflet 按数组后面的图层给更高 z-index；重新放到末尾即可置顶。
+  orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([
+    ...orthophotoVisibleIds.value.filter((visibleId) => visibleId !== id),
+    id,
+  ])
+}
+
+function ensurePanoramaComparisonForImage(id: string) {
+  const item = library.value.find((entry) => entry.id === id)
+  if (!item) return false
+
+  const existingIndex = visibleIds.value.indexOf(id)
+  if (existingIndex >= 0) {
+    activeIndex.value = existingIndex
+    selectedMapId.value = id
+    return true
+  }
+
+  if (visibleIds.value.length === 0) {
+    visibleIds.value = [id]
+    activeIndex.value = 0
+    selectedMapId.value = id
+    rebuildViews()
+    return true
+  }
+
+  if (visibleIds.value.length < MAX_PANORAMAS && canJoinComparison(item)) {
+    visibleIds.value = sanitizeVisibleIds([...visibleIds.value, id])
+  } else if (canReplaceActivePanorama(item)) {
+    const replaceIndex = Math.min(activeIndex.value, visibleIds.value.length - 1)
+    visibleIds.value = visibleIds.value.map((visibleId, index) => (index === replaceIndex ? id : visibleId))
+    activeIndex.value = replaceIndex
+  } else {
+    // 选中的是另一处坐标时，切换到该坐标的同位置对比组，保持“20 米内才可对比”的约束。
+    visibleIds.value = comparableGroup(id)
+    activeIndex.value = 0
+  }
+
+  rebuildViews()
+  const nextIndex = visibleIds.value.indexOf(id)
+  if (nextIndex >= 0) activeIndex.value = nextIndex
+  selectedMapId.value = id
+  return nextIndex >= 0
+}
+
 function regionCenter(region: MapRegion): [number, number] | null {
   if (!region.points.length) return null
   const sum = region.points.reduce(
@@ -380,6 +430,8 @@ function viewTowardPoint(image: PanoramaItem, point: [number, number], fallback:
 
 function focusRegionOnPanoramas(region: MapRegion) {
   const center = regionCenter(region)
+  const anchorId = selectedMapId.value ?? activePanorama.value?.id
+  if (anchorId) ensurePanoramaComparisonForImage(anchorId)
   if (!center || panoramas.value.length === 0) return
   views.value = panoramas.value.map((image, index) => viewTowardPoint(image, center, views.value[index] ?? DEFAULT_VIEW))
   notify('区域已保存，全景视角已对准该区域')
@@ -667,12 +719,8 @@ function goBack() {
 
 function selectMapImage(id: string) {
   selectedMapId.value = id
-  const item = library.value.find((entry) => entry.id === id)
-  if (item && isOrthophotoReady(item) && !orthophotoVisibleIds.value.includes(id)) {
-    orthophotoVisibleIds.value = sanitizeOrthophotoVisibleIds([...orthophotoVisibleIds.value, id])
-  }
-  const index = panoramas.value.findIndex((item) => item.id === id)
-  if (index >= 0) activeIndex.value = index
+  bringOrthophotoLayerToTop(id)
+  ensurePanoramaComparisonForImage(id)
 }
 
 function handleFullscreenChange() {

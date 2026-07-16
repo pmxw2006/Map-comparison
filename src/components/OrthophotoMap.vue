@@ -101,12 +101,12 @@ function rebuildMarkers() {
   const markers = markerLayer
   markers.clearLayers()
 
-  props.images.forEach((image, index) => {
+  props.images.forEach((image) => {
     if (image.latitude === null || image.longitude === null) return
     const marker = L.marker([image.latitude, image.longitude], {
       icon: L.divIcon({
         className: 'image-map-marker-host',
-        html: `<span class="image-map-marker${image.id === props.selectedId ? ' is-selected' : ''}"><b>${index + 1}</b></span>`,
+        html: `<span class="image-map-marker${image.id === props.selectedId ? ' is-selected' : ''}"></span>`,
         iconSize: [30, 36],
         iconAnchor: [15, 34],
       }),
@@ -122,6 +122,12 @@ function fitSelectedOverlay() {
   if (!map) return
   const image = selected.value
   if (image?.overlayBounds) map.fitBounds(image.overlayBounds, { padding: [70, 70], maxZoom: 19 })
+}
+
+function syncOrthophotoLayerStack() {
+  props.visibleOrthophotoIds.forEach((id, index) => {
+    orthophotoLayers.get(id)?.setZIndex(20 + index)
+  })
 }
 
 function rebuildOrthophotoOverlays(fit = false) {
@@ -152,6 +158,8 @@ function rebuildOrthophotoOverlays(fit = false) {
     orthophotoLayers.set(id, overlay)
   })
 
+  // 已存在的 ImageOverlay 不会因为 props 顺序变化自动更新层级，必须手动同步 z-index。
+  syncOrthophotoLayerStack()
   if (fit) fitSelectedOverlay()
 }
 
@@ -200,6 +208,7 @@ function redrawDraft() {
       color: regionColor.value,
       weight: 2,
       dashArray: '6 5',
+      interactive: false,
     })
     layer.addLayer(draftLine)
   }
@@ -210,6 +219,7 @@ function redrawDraft() {
       fillColor: regionColor.value,
       fillOpacity: regionOpacity.value,
       weight: 2,
+      interactive: false,
     })
     layer.addLayer(draftPolygon)
   }
@@ -221,6 +231,7 @@ function redrawDraft() {
       fillColor: regionColor.value,
       fillOpacity: 1,
       weight: 2,
+      interactive: false,
     }),
   )
   draftMarkers.forEach((marker) => layer.addLayer(marker))
@@ -376,7 +387,11 @@ onBeforeUnmount(() => {
         <span><Layers3 :size="17" /></span>
         <div>
           <strong>{{ selected?.name ?? '尚未选择影像' }}</strong>
-          <small>{{ selected ? placeText(selected) : '从影像库添加影像' }}</small>
+          <template v-if="selected">
+            <small class="coordinate-line">{{ coordinateFallback(selected) }}</small>
+            <small>{{ placeText(selected) }}</small>
+          </template>
+          <small v-else>从影像库添加影像</small>
         </div>
       </div>
 
@@ -573,6 +588,7 @@ onBeforeUnmount(() => {
 
 .map-status-heading strong { font-size: 13px; }
 .map-status-heading small { color: #75828a; font: 10px/1.2 var(--font-mono); }
+.map-status-heading .coordinate-line { color: #45525a; }
 
 .map-metadata {
   display: grid;
@@ -819,8 +835,7 @@ onBeforeUnmount(() => {
 
 :global(.image-map-marker-host) { background: transparent; border: 0; }
 :global(.image-map-marker) {
-  display: grid;
-  place-items: center;
+  display: block;
   width: 30px;
   height: 30px;
   color: #fff;
@@ -829,9 +844,7 @@ onBeforeUnmount(() => {
   border-radius: 50% 50% 50% 3px;
   box-shadow: 0 3px 8px rgba(0, 0, 0, 0.32);
   transform: rotate(-45deg);
-  font: 700 10px/1 var(--font-mono);
 }
-:global(.image-map-marker b) { transform: rotate(45deg); }
 :global(.image-map-marker.is-selected) { color: #171c1f; background: #ffb02e; }
 :global(.orthophoto-overlay-image) {
   outline: 0 solid transparent;

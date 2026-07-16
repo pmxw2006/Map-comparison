@@ -62,6 +62,25 @@ function makeVerifyPanorama() {
 
 const sampleBuffer = makeVerifyPanorama()
 
+async function waitForSelectedOrthophotoOnTop(page, records) {
+  await page.waitForFunction((items) => {
+    const selectedName = document.querySelector('.map-status-heading strong')?.textContent?.trim()
+    const selected = items.find((item) => item.name === selectedName)
+    if (!selected?.orthophoto_url) return false
+
+    const overlays = [...document.querySelectorAll('.leaflet-image-layer')]
+      .filter((element) => element instanceof HTMLImageElement)
+      .map((element) => ({
+        src: element.src,
+        zIndex: Number(element.style.zIndex || window.getComputedStyle(element).zIndex || 0),
+      }))
+      .filter((overlay) => Number.isFinite(overlay.zIndex))
+      .sort((left, right) => right.zIndex - left.zIndex)
+
+    return overlays[0]?.src.includes(selected.orthophoto_url)
+  }, records)
+}
+
 await mkdir(artifactDir, { recursive: true })
 
 const browser = await chromium.launch({
@@ -190,6 +209,18 @@ try {
   await page.getByRole('button', { name: '正射地图' }).click()
   await page.locator('.orthophoto-map').waitFor()
   await page.locator('.leaflet-image-layer').first().waitFor()
+  await waitForSelectedOrthophotoOnTop(page, created)
+
+  const markerText = await page.locator('.image-map-marker').evaluateAll((nodes) =>
+    nodes.map((node) => node.textContent?.trim()).filter(Boolean),
+  )
+  if (markerText.length) throw new Error(`Map point markers should not render numeric labels: ${markerText.join(',')}`)
+
+  const inactiveNearbyButton = page.locator('.nearby-selector button:not(.active)').first()
+  if (await inactiveNearbyButton.count()) {
+    await inactiveNearbyButton.click()
+    await waitForSelectedOrthophotoOnTop(page, created)
+  }
 
   await page.getByRole('button', { name: '开始描绘' }).click()
   const mapBox = await page.locator('.orthophoto-map').boundingBox()
@@ -198,7 +229,18 @@ try {
   await page.mouse.click(mapBox.x + mapBox.width * 0.53, mapBox.y + mapBox.height * 0.46)
   await page.mouse.click(mapBox.x + mapBox.width * 0.56, mapBox.y + mapBox.height * 0.56)
   await page.mouse.dblclick(mapBox.x + mapBox.width * 0.45, mapBox.y + mapBox.height * 0.58)
-  await page.locator('.region-list article').first().waitFor()
+  await page.waitForFunction(() => document.querySelectorAll('.region-list article').length >= 2)
+
+  await page.getByRole('button', { name: '全景视图' }).click()
+  await page.waitForFunction(() => {
+    const regions = JSON.parse(window.localStorage.getItem('duibi.mapRegions') || '[]')
+    return regions.length >= 2
+      && document.querySelectorAll('.panorama-panel').length > 0
+      && document.querySelectorAll('.region-point-marker').length >= 3
+  })
+  await page.screenshot({ path: `${artifactDir}/orthophoto-region-in-panorama.png` })
+  await page.getByRole('button', { name: '正射地图' }).click()
+  await page.locator('.orthophoto-map').waitFor()
 
   await page.getByRole('button', { name: /影像库/ }).click()
   const kmlDownload = page.waitForEvent('download')
